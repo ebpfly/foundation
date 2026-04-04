@@ -1,0 +1,261 @@
+"""Phase 1: Self-supervised spectral pretraining.
+
+Trains SpectralNP on simulated at-sensor radiance from the USGS spectral
+library + radiative transfer.  The model learns to reconstruct dense
+spectra from sparse, randomly-sampled band subsets while simultaneously
+estimating atmospheric parameters.
+
+Usage:
+    python -m spectralnp.training.pretrain \
+        --usgs-data /path/to/usgs_splib07 \
+        --epochs 100 \
+        --batch-size 64 \
+        --lr 3e-4
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from spectralnp.data.dataset import SpectralNPDataset, collate_spectral_batch
+from spectralnp.data.usgs_speclib import SpectralLibrary, load_from_directory, load_from_zip
+from spectralnp.model.spectralnp import SpectralNP, SpectralNPConfig
+from spectralnp.training.losses import SpectralNPLoss
+
+logger = logging.getLogger(__name__)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Pretrain SpectralNP")
+    p.add_argument("--usgs-data", type=str, required=True,
+                    help="Path to USGS spectral library (directory or .zip)")
+    p.add_argument("--output-dir", type=str, default="checkpoints",
+                    help="Where to save checkpoints")
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--samples-per-epoch", type=int, default=100_000)
+    p.add_argument("--min-bands", type=int, default=3)
+    p.add_argument("--max-bands", type=int, default=200)
+    p.add_argument("--d-model", type=int, default=256)
+    p.add_argument("--n-layers", type=int, default=6)
+    p.add_argument("--z-dim", type=int, default=128)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
+    p.add_argument("--num-workers", type=int, default=4)
+    # KL annealing.
+    p.add_argument("--kl-warmup-epochs", type=int, default=10,
+                    help="Linearly anneal KL weight from 0 to target over this many epochs")
+    return p
+
+
+def get_device(arg: str) -> torch.device:
+    if arg == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(arg)
+
+
+def train_one_epoch(
+    model: SpectralNP,
+    loader: DataLoader,
+    loss_fn: SpectralNPLoss,
+    optimiser: torch.optim.Optimizer,
+    device: torch.device,
+    kl_weight: float = 1.0,
+) -> dict[str, float]:
+    """Train for one epoch, return mean losses."""
+    model.train()
+    running = {}
+    n_batches = 0
+
+    for batch in loader:
+        # Move to device.
+        wavelength = batch["wavelength"].to(device)
+        fwhm = batch["fwhm"].to(device)
+        radiance = batch["radiance"].to(device)
+        pad_mask = batch["pad_mask"].to(device)
+        target_wl = batch["target_wavelength"].to(device)
+        target_rad = batch["target_radiance"].to(device)
+        target_atmos = batch["atmos_params"].to(device)
+        material_idx = batch["material_idx"].to(device)
+
+        # Forward pass.
+        output = model(
+            wavelength=wavelength,
+            fwhm=fwhm,
+            radiance=radiance,
+            pad_mask=pad_mask,
+            query_wavelength=target_wl,
+        )
+
+        # Also compute "target" posterior (all bands) for NP KL.
+        # In pretraining, we pass the dense spectrum through a second
+        # encode call to get the full-information posterior.
+        with torch.no_grad():
+            # Approximate: use target radiance at dense wavelengths as "all bands".
+            # For efficiency, subsample to ~50 query points.
+            n_dense = target_wl.shape[1]
+            subsample = torch.randperm(n_dense, device=device)[:50].sort().values
+            dense_wl_sub = target_wl[:, subsample]
+            dense_fwhm_sub = torch.ones_like(dense_wl_sub) * 5.0  # narrow bands
+            dense_rad_sub = target_rad[:, subsample]
+            _, prior_mu, prior_log_sigma = model.encode(
+                dense_wl_sub, dense_fwhm_sub, dense_rad_sub
+            )
+
+        # Override KL weight for annealing.
+        original_kl = loss_fn.w_kl
+        loss_fn.w_kl = original_kl * kl_weight
+
+        losses = loss_fn(
+            output,
+            target_radiance=target_rad,
+            target_atmos=target_atmos,
+            target_material=material_idx,
+            prior_mu=prior_mu,
+            prior_log_sigma=prior_log_sigma,
+        )
+
+        loss_fn.w_kl = original_kl
+
+        # Backward.
+        optimiser.zero_grad()
+        losses["total"].backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimiser.step()
+
+        # Accumulate.
+        for k, v in losses.items():
+            running[k] = running.get(k, 0.0) + v.item()
+        n_batches += 1
+
+    return {k: v / n_batches for k, v in running.items()}
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    device = get_device(args.device)
+    logger.info(f"Using device: {device}")
+
+    # Load spectral library.
+    usgs_path = Path(args.usgs_data)
+    if usgs_path.suffix == ".zip":
+        speclib = load_from_zip(usgs_path)
+    else:
+        speclib = load_from_directory(usgs_path)
+    # Filter to the ASD range with full coverage.
+    speclib = speclib.filter_wavelength_range(380, 2400)
+    logger.info(f"Loaded {len(speclib)} spectra from USGS library")
+
+    if len(speclib) == 0:
+        raise RuntimeError("No spectra with full 380-2400 nm coverage found. "
+                           "Check your USGS data path.")
+
+    # Dataset.
+    dataset = SpectralNPDataset(
+        spectral_library=speclib,
+        samples_per_epoch=args.samples_per_epoch,
+        n_bands_range=(args.min_bands, args.max_bands),
+        seed=args.seed,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        collate_fn=collate_spectral_batch,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    # Model.
+    cfg = SpectralNPConfig(
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        z_dim=args.z_dim,
+        n_material_classes=len(speclib),
+    )
+    model = SpectralNP(cfg).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model parameters: {n_params:,}")
+
+    # Optimiser.
+    optimiser = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
+
+    # Loss.
+    loss_fn = SpectralNPLoss()
+
+    # Optional W&B.
+    if args.wandb:
+        import wandb
+        wandb.init(project="spectralnp", config=vars(args))
+        wandb.watch(model, log_freq=100)
+
+    # Output directory.
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Training loop.
+    best_loss = float("inf")
+    for epoch in range(args.epochs):
+        # KL annealing.
+        kl_weight = min(1.0, epoch / max(args.kl_warmup_epochs, 1))
+
+        metrics = train_one_epoch(model, loader, loss_fn, optimiser, device, kl_weight)
+        scheduler.step()
+
+        lr = scheduler.get_last_lr()[0]
+        logger.info(
+            f"Epoch {epoch+1}/{args.epochs}  "
+            f"loss={metrics['total']:.4f}  "
+            f"spectral={metrics.get('spectral', 0):.4f}  "
+            f"atmos={metrics.get('atmos', 0):.4f}  "
+            f"kl={metrics.get('kl', 0):.4f}  "
+            f"lr={lr:.2e}"
+        )
+
+        if args.wandb:
+            import wandb
+            wandb.log({"epoch": epoch + 1, "lr": lr, **metrics})
+
+        # Save checkpoint.
+        if metrics["total"] < best_loss:
+            best_loss = metrics["total"]
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimiser_state_dict": optimiser.state_dict(),
+                "config": cfg,
+                "loss": best_loss,
+            }, out_dir / "best.pt")
+
+        if (epoch + 1) % 10 == 0:
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimiser_state_dict": optimiser.state_dict(),
+                "config": cfg,
+            }, out_dir / f"epoch_{epoch+1}.pt")
+
+    logger.info(f"Training complete. Best loss: {best_loss:.4f}")
+
+
+if __name__ == "__main__":
+    main()
