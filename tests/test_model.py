@@ -16,6 +16,8 @@ def model():
         n_frequencies=16,
         n_latents=8,
         z_dim=32,
+        z_atm_dim=8,
+        z_surf_dim=24,
         spectral_hidden=64,
         spectral_n_layers=2,
         n_material_classes=10,
@@ -38,7 +40,9 @@ def test_forward_shapes(model):
     assert out.spectral_log_var.shape == (B, Q)
     assert out.material_logits.shape == (B, 10)
     assert out.atmos_gamma.shape == (B, 4)
-    assert out.z_mu.shape == (B, 32)
+    assert out.z_mu.shape == (B, 32)         # combined z_atm + z_surf
+    assert out.z_atm_mu.shape == (B, 8)
+    assert out.z_surf_mu.shape == (B, 24)
 
 
 def test_variable_band_count(model):
@@ -84,8 +88,8 @@ def test_uncertainty_increases_with_fewer_bands(model):
     rad_many = torch.randn(1, many_bands).abs() * 50
 
     with torch.no_grad():
-        _, mu_few, logsig_few = model.encode(wl_few, fwhm_few, rad_few)
-        _, mu_many, logsig_many = model.encode(wl_many, fwhm_many, rad_many)
+        _, _, _, _, _, z_mu_few, logsig_few = model.encode(wl_few, fwhm_few, rad_few)
+        _, _, _, _, _, z_mu_many, logsig_many = model.encode(wl_many, fwhm_many, rad_many)
 
     # The posterior with fewer bands should have larger sigma on average.
     # (This is a soft test — it holds in expectation after training,
@@ -128,3 +132,27 @@ def test_no_spectral_decoder_when_no_queries(model):
     assert out.spectral_mu is None
     assert out.material_logits is not None
     assert out.atmos_gamma is not None
+
+
+def test_multi_pixel_context(model):
+    """Forward pass with context pixels from the same scene."""
+    B, N, K, N_ctx, Q = 2, 10, 5, 8, 50
+    # Target pixel.
+    wl = torch.linspace(400, 2200, N).unsqueeze(0).expand(B, -1)
+    fwhm = torch.full((B, N), 15.0)
+    rad = torch.randn(B, N).abs() * 30
+    q_wl = torch.linspace(400, 2400, Q).unsqueeze(0).expand(B, -1)
+
+    # Context pixels (K pixels, each with N_ctx bands).
+    ctx_wl = torch.linspace(400, 2200, N_ctx).unsqueeze(0).unsqueeze(0).expand(B, K, -1)
+    ctx_fwhm = torch.full((B, K, N_ctx), 15.0)
+    ctx_rad = torch.randn(B, K, N_ctx).abs() * 30
+
+    out = model(wl, fwhm, rad, query_wavelength=q_wl,
+                context_wavelength=ctx_wl, context_fwhm=ctx_fwhm,
+                context_radiance=ctx_rad)
+
+    assert out.spectral_mu.shape == (B, Q)
+    assert out.z_atm_mu.shape == (B, 8)
+    assert out.z_surf_mu.shape == (B, 24)
+    assert out.atmos_gamma.shape == (B, 4)

@@ -111,7 +111,7 @@ def train_one_epoch(
             dense_wl_sub = target_wl[:, subsample]
             dense_fwhm_sub = torch.ones_like(dense_wl_sub) * 5.0  # narrow bands
             dense_rad_sub = target_rad[:, subsample]
-            _, prior_mu, prior_log_sigma = model.encode(
+            _, _, _, _, _, prior_mu, prior_log_sigma = model.encode(
                 dense_wl_sub, dense_fwhm_sub, dense_rad_sub
             )
 

@@ -222,7 +222,7 @@ class TestUncertaintyScaling:
                     wl_t = torch.tensor(sensor.center_wavelength_nm).unsqueeze(0)
                     fw_t = torch.tensor(sensor.fwhm_nm).unsqueeze(0)
                     rad_t = torch.tensor(band_rad).unsqueeze(0)
-                    _, _, z_logsig = trained_model.encode(wl_t, fw_t, rad_t)
+                    _, _, _, _, _, _, z_logsig = trained_model.encode(wl_t, fw_t, rad_t)
                     bucket.append(z_logsig.exp().mean().item())
 
         mean_few = np.mean(sigma_few)

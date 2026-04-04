@@ -250,7 +250,7 @@ class SpectralAggregator(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        # Stochastic path.
+        # Stochastic path: per-pixel surface latent.
         self.stochastic = StochasticEncoder(d_model, z_dim)
 
     def forward(
@@ -279,9 +279,7 @@ class SpectralAggregator(nn.Module):
         z_log_sigma : Tensor[B, z_dim]
             Log-std of the latent posterior.
         """
-        # Self-attention over bands.
-        for layer in self.layers:
-            h = layer(h, wavelength, pad_mask)
+        h = self.encode_bands(h, wavelength, pad_mask)
 
         # --- Deterministic path ---
         B = h.shape[0]
@@ -295,3 +293,80 @@ class SpectralAggregator(nn.Module):
         z_mu, z_log_sigma = self.stochastic(h, pad_mask)
 
         return r, z_mu, z_log_sigma
+
+    def encode_bands(
+        self,
+        h: Tensor,
+        wavelength: Tensor,
+        pad_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Run self-attention over bands only (shared by single- and multi-pixel paths).
+
+        Returns the transformed band features h.
+        """
+        for layer in self.layers:
+            h = layer(h, wavelength, pad_mask)
+        return h
+
+
+class CrossPixelAggregator(nn.Module):
+    """Aggregate per-pixel representations into a shared atmospheric latent.
+
+    Given deterministic representations from K context pixels that share
+    the same atmosphere, produce a posterior q(z_atm | pixel_1, ..., pixel_K).
+
+    With K=1 the posterior is wide (uninformative) and the model degrades
+    gracefully to single-pixel behaviour.
+
+    Parameters
+    ----------
+    d_model : int
+        Per-pixel representation dimension.
+    z_atm_dim : int
+        Atmospheric latent dimensionality.
+    n_heads : int
+        Attention heads for cross-pixel attention.
+    n_queries : int
+        Number of learnable atmospheric query vectors.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 256,
+        z_atm_dim: int = 32,
+        n_heads: int = 4,
+        n_queries: int = 8,
+    ) -> None:
+        super().__init__()
+        self.atm_queries = nn.Parameter(torch.randn(n_queries, d_model) * 0.02)
+        self.cross_attn = CrossAttention(d_model, n_heads)
+        self.norm = nn.LayerNorm(d_model)
+        self.to_mu = nn.Linear(d_model, z_atm_dim)
+        self.to_log_sigma = nn.Linear(d_model, z_atm_dim)
+
+    def forward(
+        self,
+        pixel_reps: Tensor,
+        pixel_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Produce atmospheric latent posterior from context pixels.
+
+        Parameters
+        ----------
+        pixel_reps : Tensor[B, K, d_model]
+            Deterministic representations of K context pixels.
+        pixel_mask : Tensor[B, K] bool, optional
+            True = valid pixel, False = padding.
+
+        Returns
+        -------
+        z_atm_mu : Tensor[B, z_atm_dim]
+        z_atm_log_sigma : Tensor[B, z_atm_dim]
+        """
+        B = pixel_reps.shape[0]
+        queries = self.atm_queries.unsqueeze(0).expand(B, -1, -1)
+        attended = self.cross_attn(queries, pixel_reps, mask=pixel_mask)
+        pooled = self.norm(attended).mean(dim=1)  # (B, d_model)
+        mu = self.to_mu(pooled)
+        log_sigma = self.to_log_sigma(pooled).clamp(-10.0, 2.0)
+        return mu, log_sigma

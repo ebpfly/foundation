@@ -120,12 +120,13 @@ def apply_sensor(
     -------
     (N_bands,) or (B, N_bands) band-integrated values.
     """
-    centers = sensor.center_wavelength_nm[:, np.newaxis]  # (N, 1)
-    sigmas = sensor.fwhm_nm[:, np.newaxis] / 2.355         # (N, 1)
-    wl = wavelength_nm[np.newaxis, :]                       # (1, W)
+    from spectralnp.data.srf import pseudo_voigt
 
-    srf = np.exp(-0.5 * ((wl - centers) / sigmas) ** 2)
-    srf /= srf.sum(axis=1, keepdims=True) + 1e-30  # normalise
+    srf = pseudo_voigt(
+        wavelength_nm[np.newaxis, :],
+        sensor.center_wavelength_nm[:, np.newaxis],
+        sensor.fwhm_nm[:, np.newaxis],
+    )
 
     if spectrum.ndim == 1:
         return srf @ spectrum

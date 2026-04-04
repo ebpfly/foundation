@@ -28,18 +28,18 @@ class SensorDefinition:
         return len(self.center_wavelength_nm)
 
     def spectral_response(self, wavelength_nm: np.ndarray) -> np.ndarray:
-        """Compute Gaussian spectral response functions for all bands.
+        """Compute pseudo-Voigt spectral response functions for all bands.
 
         Returns (n_bands, len(wavelength_nm)) array of response weights,
         each normalised to integrate to 1.
         """
-        wl = wavelength_nm[np.newaxis, :]    # (1, W)
-        centers = self.center_wavelength_nm[:, np.newaxis]  # (B, 1)
-        sigmas = (self.fwhm_nm[:, np.newaxis] / 2.355)     # FWHM -> sigma
-        srf = np.exp(-0.5 * ((wl - centers) / sigmas) ** 2)
-        # Normalise each band's response.
-        srf /= srf.sum(axis=1, keepdims=True) + 1e-30
-        return srf
+        from spectralnp.data.srf import pseudo_voigt
+
+        return pseudo_voigt(
+            wavelength_nm[np.newaxis, :],
+            self.center_wavelength_nm[:, np.newaxis],
+            self.fwhm_nm[:, np.newaxis],
+        )
 
     def convolve(self, wavelength_nm: np.ndarray, spectrum: np.ndarray) -> np.ndarray:
         """Convolve a high-resolution spectrum with this sensor's SRFs.

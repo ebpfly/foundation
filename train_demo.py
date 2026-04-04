@@ -25,8 +25,6 @@ def main():
     device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
     logger.info(f"Device: {device}")
 
     # Generate synthetic spectral library.
@@ -59,6 +57,8 @@ def main():
         z_dim=64,
         spectral_hidden=256,
         spectral_n_layers=3,
+        z_atm_dim=16,
+        z_surf_dim=48,
         n_material_classes=len(speclib),
         n_atmos_params=4,
         dropout=0.1,
