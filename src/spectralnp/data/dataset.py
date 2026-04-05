@@ -3,7 +3,7 @@
 Generates training samples on-the-fly:
 1. Sample a surface reflectance from the USGS spectral library
 2. Sample random atmospheric state and viewing geometry
-3. Simulate at-sensor radiance (via RTM or simplified model)
+3. Simulate at-sensor radiance (via LUT, full ARTS, or simplified model)
 4. Generate a random virtual sensor (augmentation)
 5. Convolve radiance with virtual sensor SRFs + add noise
 6. Return (input bands, target dense spectrum, atmospheric params)
@@ -12,13 +12,13 @@ Generates training samples on-the-fly:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from spectralnp.data.random_sensor import (
-    VirtualSensor,
     add_sensor_noise,
     apply_sensor,
     sample_virtual_sensor,
@@ -64,6 +64,9 @@ class SpectralNPDataset(Dataset):
     samples_per_epoch : int
         Number of samples per "epoch" (since data is generated on-the-fly).
     n_bands_range : (min, max) bands for random sensor.
+    lut_path : str or Path, optional
+        Path to a pre-computed ARTS LUT (HDF5).  When provided, samples use
+        the LUT for radiative transfer instead of the simplified model.
     use_full_rtm : bool
         If True, use PyARTS for simulation (slow but accurate).
         If False, use the simplified two-stream model.
@@ -77,6 +80,7 @@ class SpectralNPDataset(Dataset):
         dense_wavelength_nm: np.ndarray | None = None,
         samples_per_epoch: int = 100_000,
         n_bands_range: tuple[int, int] = (3, 200),
+        lut_path: str | Path | None = None,
         use_full_rtm: bool = False,
         seed: int = 42,
     ) -> None:
@@ -84,6 +88,13 @@ class SpectralNPDataset(Dataset):
         self.n_spectra = len(spectral_library)
         if self.n_spectra == 0:
             raise ValueError("Spectral library is empty")
+
+        # Load LUT if provided.
+        self.lut = None
+        if lut_path is not None:
+            from spectralnp.data.lut import SpectralLUT
+
+            self.lut = SpectralLUT(lut_path)
 
         if dense_wavelength_nm is None:
             dense_wavelength_nm = np.arange(380.0, 2501.0, 5.0)
@@ -100,6 +111,12 @@ class SpectralNPDataset(Dataset):
         # Clip to physical range.
         self.reflectance_matrix = np.clip(self.reflectance_matrix, 0.0, 1.0).astype(np.float32)
 
+        # If LUT is used, also pre-resample spectra onto LUT wavelength grid.
+        if self.lut is not None:
+            self._lut_reflectance = spectral_library.to_array(self.lut.wavelength_nm)
+            self._lut_reflectance = np.nan_to_num(self._lut_reflectance, nan=0.0)
+            self._lut_reflectance = np.clip(self._lut_reflectance, 0.0, 1.0).astype(np.float32)
+
         self._arts_sim = None
 
     def __len__(self) -> int:
@@ -111,8 +128,13 @@ class SpectralNPDataset(Dataset):
             aod_550=self.rng.uniform(0.01, 1.0),
             water_vapour=self.rng.uniform(0.2, 5.0),
             ozone_du=self.rng.uniform(200, 500),
+            co2_ppmv=self.rng.uniform(400, 450),
+            ch4_ppbv=self.rng.uniform(1800, 2000),
+            n2o_ppbv=self.rng.uniform(320, 345),
+            co_ppbv=self.rng.uniform(60, 250),
             visibility_km=self.rng.uniform(5, 100),
             surface_altitude_km=self.rng.uniform(0, 3),
+            surface_temperature_k=self.rng.uniform(260, 330),
         )
 
     def _sample_geometry(self) -> ViewGeometry:
@@ -134,13 +156,36 @@ class SpectralNPDataset(Dataset):
         geometry = self._sample_geometry()
 
         # 3. Simulate at-sensor radiance.
-        result = simplified_toa_radiance(
-            surface_reflectance=reflectance,
-            wavelength_nm=self.dense_wl,
-            atmos=atmos,
-            geometry=geometry,
-        )
-        dense_radiance = result.toa_radiance.astype(np.float32)
+        if self.lut is not None:
+            # LUT-based RT: compute on LUT grid, resample to dense grid.
+            lut_refl = self._lut_reflectance[spec_idx].astype(np.float64)
+            lut_radiance = self.lut.toa_radiance(
+                lut_refl,
+                water_vapour=atmos.water_vapour,
+                ozone_du=atmos.ozone_du,
+                co2_ppmv=atmos.co2_ppmv,
+                ch4_ppbv=atmos.ch4_ppbv,
+                n2o_ppbv=atmos.n2o_ppbv,
+                co_ppbv=atmos.co_ppbv,
+                surface_altitude_km=atmos.surface_altitude_km,
+                solar_zenith_deg=geometry.solar_zenith_deg,
+                sensor_zenith_deg=geometry.sensor_zenith_deg,
+                relative_azimuth_deg=geometry.relative_azimuth_deg,
+                sensor_altitude_km=geometry.sensor_altitude_km,
+                surface_temperature_k=atmos.surface_temperature_k or 300.0,
+                aod_550=atmos.aod_550,
+            )
+            dense_radiance = np.interp(
+                self.dense_wl, self.lut.wavelength_nm, lut_radiance
+            ).astype(np.float32)
+        else:
+            result = simplified_toa_radiance(
+                surface_reflectance=reflectance,
+                wavelength_nm=self.dense_wl,
+                atmos=atmos,
+                geometry=geometry,
+            )
+            dense_radiance = result.toa_radiance.astype(np.float32)
 
         # 4. Generate random virtual sensor.
         sensor = sample_virtual_sensor(
