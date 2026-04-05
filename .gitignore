@@ -16,9 +16,13 @@ build/
 .ipynb_checkpoints/
 
 # Data
+/data/
 *.zip
 *.h5
 *.hdf5
+
+# Generated plots
+*.png
 
 # OS
 .DS_Store

@@ -1,13 +1,10 @@
 """USGS Spectral Library v7 loader.
 
-Downloads and parses the USGS Spectral Library v7 ASCII data,
-providing surface reflectance spectra for training data generation.
+Parses the USGS Spectral Library v7 (splib07a) ASCII data.
+The library uses single-column reflectance files with separate
+wavelength/bandpass files per spectrometer (ASD, Beckman, Nicolet, AVIRIS).
 
-The library contains ~1300 spectra of minerals, soils, vegetation,
-water, and man-made materials measured from 0.2-200 um.
-
-We focus on the ASD range (0.35-2.5 um) which covers the common
-remote sensing window.
+Sentinel value -1.23e+34 marks deleted/bad channels.
 """
 
 from __future__ import annotations
@@ -21,24 +18,27 @@ from pathlib import Path
 
 import numpy as np
 
-# Default cache location.
 _CACHE_DIR = Path(os.environ.get("SPECTRALNP_DATA", Path.home() / ".spectralnp" / "data"))
-_USGS_ZIP_URL = (
-    "https://crustal.usgs.gov/speclab/QueryAll07a.php?quick_filter=702"
-)
 
-# We ship a download helper but the primary workflow is to point at
-# an already-downloaded copy of the ASCII data.
+MATERIAL_CATEGORIES = {
+    "ChapterA": "artificial",
+    "ChapterC": "coatings",
+    "ChapterL": "liquids",
+    "ChapterM": "minerals",
+    "ChapterO": "organics",
+    "ChapterS": "soils",
+    "ChapterV": "vegetation",
+}
 
-MATERIAL_CATEGORIES = [
-    "minerals",
-    "soils",
-    "vegetation",
-    "water",
-    "manmade",
-    "mixtures",
-    "coatings",
-]
+# Map filename substrings to the spectrometer wavelength/bandpass files.
+_SPECTROMETER_MAP = {
+    "ASD": "ASD",
+    "BECK": "BECK",
+    "NIC4": "NIC4",
+    "AVIRIS": "AVIRIS",
+}
+
+_BAD_VALUE_THRESHOLD = -1.2e34
 
 
 @dataclass
@@ -48,9 +48,9 @@ class Spectrum:
     name: str
     category: str
     wavelength_um: np.ndarray   # wavelength in micrometres
-    reflectance: np.ndarray     # dimensionless [0, 1] (may have negatives for noise)
+    reflectance: np.ndarray     # dimensionless (may have negatives for noise)
     description: str = ""
-    measurement_type: str = ""  # e.g., "ASD", "Beckman", "Nicolet"
+    spectrometer: str = ""      # e.g., "ASD", "BECK", "NIC4", "AVIRIS"
 
     @property
     def wavelength_nm(self) -> np.ndarray:
@@ -82,6 +82,9 @@ class SpectralLibrary:
     def filter_category(self, category: str) -> SpectralLibrary:
         return SpectralLibrary([s for s in self.spectra if s.category == category])
 
+    def filter_spectrometer(self, spectrometer: str) -> SpectralLibrary:
+        return SpectralLibrary([s for s in self.spectra if s.spectrometer == spectrometer])
+
     def filter_wavelength_range(self, lo_nm: float, hi_nm: float) -> SpectralLibrary:
         """Keep only spectra that have coverage in the given range."""
         out = []
@@ -98,115 +101,211 @@ class SpectralLibrary:
         """
         return np.stack([s.resample(wavelength_nm) for s in self.spectra])
 
+    @property
+    def categories(self) -> list[str]:
+        return sorted({s.category for s in self.spectra})
 
-def _parse_asd_ascii(text: str, filename: str) -> Spectrum | None:
-    """Parse a single USGS ASCII spectrum file.
 
-    The USGS ASCII format has a header section followed by two-column data
-    (wavelength in micrometres, reflectance).  Lines with -1.23e+34 are
-    flagged as deleted/bad channels.
-    """
+def _read_single_column(text: str) -> np.ndarray:
+    """Parse a single-column USGS ASCII file (1 header line, then floats)."""
     lines = text.strip().splitlines()
-    if len(lines) < 10:
-        return None
-
-    # Extract name from first line.
-    name = lines[0].strip()
-
-    # Detect category from filename path.
-    category = "unknown"
-    fname_lower = filename.lower()
-    for cat in MATERIAL_CATEGORIES:
-        if cat in fname_lower:
-            category = cat
-            break
-
-    # Find data start: first line that looks like two floats.
-    data_start = None
-    for i, line in enumerate(lines):
-        parts = line.strip().split()
-        if len(parts) >= 2:
-            try:
-                float(parts[0])
-                float(parts[1])
-                data_start = i
-                break
-            except ValueError:
-                continue
-
-    if data_start is None:
-        return None
-
-    wavelengths = []
-    reflectances = []
-    for line in lines[data_start:]:
-        parts = line.strip().split()
-        if len(parts) < 2:
+    if len(lines) < 2:
+        return np.array([], dtype=np.float64)
+    values = []
+    for line in lines[1:]:  # skip header
+        line = line.strip()
+        if not line:
             continue
         try:
-            wl = float(parts[0])
-            refl = float(parts[1])
+            values.append(float(line))
         except ValueError:
             continue
-        # Skip deleted channels (flagged as -1.23e+34 in USGS format).
-        if refl < -1e30:
-            continue
-        if wl <= 0:
-            continue
-        wavelengths.append(wl)
-        reflectances.append(refl)
+    return np.array(values, dtype=np.float64)
 
-    if len(wavelengths) < 10:
+
+def _detect_spectrometer(filename: str) -> str | None:
+    """Determine spectrometer type from filename."""
+    fname = filename.upper()
+    if "AVIRIS" in fname:
+        return "AVIRIS"
+    if "NIC4" in fname:
+        return "NIC4"
+    if "BECK" in fname:
+        return "BECK"
+    if "ASD" in fname:
+        return "ASD"
+    return None
+
+
+def _detect_category(filepath: str) -> str:
+    """Detect material category from directory path."""
+    for key, cat in MATERIAL_CATEGORIES.items():
+        if key in filepath:
+            return cat
+    return "unknown"
+
+
+def _parse_spectrum(
+    text: str,
+    filepath: str,
+    wavelength_um: np.ndarray,
+) -> Spectrum | None:
+    """Parse a single-column spectrum file paired with its wavelength grid."""
+    values = _read_single_column(text)
+    if len(values) == 0:
         return None
+
+    # Wavelength and spectrum must have the same number of channels.
+    if len(values) != len(wavelength_um):
+        return None
+
+    # Mask bad/deleted channels (sentinel -1.23e+34).
+    good = values > _BAD_VALUE_THRESHOLD
+    if good.sum() < 10:
+        return None
+
+    wl_good = wavelength_um[good]
+    refl_good = values[good]
+
+    # Extract name from first line.
+    lines = text.strip().splitlines()
+    name = lines[0].strip() if lines else filepath.split("/")[-1]
+    # Clean up the record prefix.
+    name = re.sub(r"^splib07a\s+Record=\d+:\s*", "", name).strip()
+
+    spectrometer = _detect_spectrometer(filepath) or ""
+    category = _detect_category(filepath)
 
     return Spectrum(
         name=name,
         category=category,
-        wavelength_um=np.array(wavelengths, dtype=np.float64),
-        reflectance=np.array(reflectances, dtype=np.float64),
+        wavelength_um=wl_good,
+        reflectance=refl_good,
+        spectrometer=spectrometer,
     )
 
 
-def load_from_directory(data_dir: str | Path) -> SpectralLibrary:
-    """Load all ASCII spectra from a directory tree.
-
-    Expects the USGS Spectral Library v7 ASCII data layout:
-        data_dir/
-            ASCIIdata/
-                ...subdirectories with .txt files...
-
-    Parameters
-    ----------
-    data_dir : path to extracted USGS spectral library data.
-
-    Returns
-    -------
-    SpectralLibrary with all successfully parsed spectra.
-    """
-    data_dir = Path(data_dir)
-    spectra: list[Spectrum] = []
-    for txt_path in sorted(data_dir.rglob("*.txt")):
-        try:
-            text = txt_path.read_text(errors="replace")
-        except Exception:
+def _find_wavelength_files(file_list: list[str]) -> dict[str, str]:
+    """Map spectrometer code → wavelength filename."""
+    mapping = {}
+    for f in file_list:
+        fname = f.split("/")[-1].upper()
+        if "WAVELENGTH" not in fname:
             continue
-        spec = _parse_asd_ascii(text, str(txt_path))
-        if spec is not None:
-            spectra.append(spec)
-    return SpectralLibrary(spectra)
+        if "ASD" in fname:
+            mapping["ASD"] = f
+        elif "BECK" in fname:
+            mapping["BECK"] = f
+        elif "NIC4" in fname:
+            mapping["NIC4"] = f
+        elif "AVIRIS" in fname:
+            mapping["AVIRIS"] = f
+    return mapping
+
+
+def _find_bandpass_files(file_list: list[str]) -> dict[str, str]:
+    """Map spectrometer code → bandpass filename."""
+    mapping = {}
+    for f in file_list:
+        fname = f.split("/")[-1].upper()
+        if "BANDPASS" not in fname:
+            continue
+        if "ASDFR" in fname:
+            mapping["ASDFR"] = f
+        elif "ASDHR" in fname:
+            mapping["ASDHR"] = f
+        elif "ASDNG" in fname:
+            mapping["ASDNG"] = f
+        elif "AVIRIS" in fname:
+            mapping["AVIRIS"] = f
+        elif "BECK" in fname:
+            mapping["BECK"] = f
+        elif "NIC4" in fname:
+            mapping["NIC4"] = f
+    return mapping
 
 
 def load_from_zip(zip_path: str | Path) -> SpectralLibrary:
-    """Load spectra directly from the USGS zip archive without full extraction."""
+    """Load spectra from the USGS splib07a zip without full extraction.
+
+    Reads wavelength grids first, then pairs each spectrum file with
+    its corresponding wavelength grid based on spectrometer type.
+    """
     zip_path = Path(zip_path)
     spectra: list[Spectrum] = []
+
     with zipfile.ZipFile(zip_path) as zf:
-        for info in zf.infolist():
-            if not info.filename.endswith(".txt"):
-                continue
-            with zf.open(info) as f:
+        all_files = [info.filename for info in zf.infolist()]
+        txt_files = [f for f in all_files if f.endswith(".txt")]
+
+        # Load wavelength grids per spectrometer.
+        wl_file_map = _find_wavelength_files(txt_files)
+        wl_grids: dict[str, np.ndarray] = {}
+        for spec_code, wl_file in wl_file_map.items():
+            with zf.open(wl_file) as f:
                 text = io.TextIOWrapper(f, errors="replace").read()
-            spec = _parse_asd_ascii(text, info.filename)
+            wl_grids[spec_code] = _read_single_column(text)
+
+        # Parse each spectrum file.
+        spectrum_files = [
+            f for f in txt_files
+            if "Chapter" in f and f.endswith(".txt")
+        ]
+
+        for filepath in spectrum_files:
+            spec_type = _detect_spectrometer(filepath)
+            if spec_type is None or spec_type not in wl_grids:
+                continue
+
+            with zf.open(filepath) as f:
+                text = io.TextIOWrapper(f, errors="replace").read()
+
+            spec = _parse_spectrum(text, filepath, wl_grids[spec_type])
             if spec is not None:
                 spectra.append(spec)
+
+    return SpectralLibrary(spectra)
+
+
+def load_from_directory(data_dir: str | Path) -> SpectralLibrary:
+    """Load all ASCII spectra from an extracted splib07a directory.
+
+    Expects:
+        data_dir/
+            ASCIIdata_splib07a/   (or files directly in data_dir)
+                splib07a_Wavelengths_*.txt
+                splib07a_Bandpass_*.txt
+                ChapterM_Minerals/*.txt
+                ChapterS_SoilsAndMixtures/*.txt
+                ...
+    """
+    data_dir = Path(data_dir)
+    txt_files = sorted(str(p) for p in data_dir.rglob("*.txt"))
+
+    # Relativised names for the finder functions.
+    rel_files = [str(p) for p in txt_files]
+
+    # Load wavelength grids.
+    wl_file_map = _find_wavelength_files(rel_files)
+    wl_grids: dict[str, np.ndarray] = {}
+    for spec_code, wl_file in wl_file_map.items():
+        text = Path(wl_file).read_text(errors="replace")
+        wl_grids[spec_code] = _read_single_column(text)
+
+    # Parse spectra.
+    spectra: list[Spectrum] = []
+    for filepath in txt_files:
+        if "Chapter" not in filepath:
+            continue
+        spec_type = _detect_spectrometer(filepath)
+        if spec_type is None or spec_type not in wl_grids:
+            continue
+        try:
+            text = Path(filepath).read_text(errors="replace")
+        except Exception:
+            continue
+        spec = _parse_spectrum(text, filepath, wl_grids[spec_type])
+        if spec is not None:
+            spectra.append(spec)
+
     return SpectralLibrary(spectra)
