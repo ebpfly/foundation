@@ -51,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--lut-path", type=str, default=None,
+                    help="Path to pre-computed HDF5 layer-optical-depth LUT "
+                         "(from build_lut.py). Enables fast LUT-based RTM.")
     # KL annealing.
     p.add_argument("--kl-warmup-epochs", type=int, default=10,
                     help="Linearly anneal KL weight from 0 to target over this many epochs")
@@ -172,6 +175,7 @@ def main() -> None:
         spectral_library=speclib,
         samples_per_epoch=args.samples_per_epoch,
         n_bands_range=(args.min_bands, args.max_bands),
+        lut_path=args.lut_path,
         seed=args.seed,
     )
     loader = DataLoader(
