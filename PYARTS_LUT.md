@@ -1,49 +1,19 @@
-# PyARTS LUT: Next Steps
+# PyARTS LUT: Status & Notes
 
 ## Overview
 
 The LUT caches ARTS line-by-line gas absorption (the expensive part) as per-layer optical depths. Runtime path integration (transmittance, emission, any geometry/altitude) is fast vectorised NumPy.
 
-## 1. Verify PyARTS API compatibility
+## 1. PyARTS API compatibility — DONE
 
-The `_compute_layer_optics` method in `src/spectralnp/data/lut.py` extracts per-layer absorption coefficients from ARTS. This is the most API-sensitive part — the exact calls for accessing `AtmField` grids, `AtmPoint`, and `propmat_clearsky` may differ between pyarts versions.
+Verified against **pyarts 2.6.18** (conda env `atmgen-pyarts`). The code now uses the ARTS 2.6 workspace-variable API:
 
-Run this on your ARTS machine to check:
-
-```python
-import pyarts
-import numpy as np
-
-ws = pyarts.Workspace()
-ws.atmosphere_dim = 1
-ws.stokes_dim = 1
-ws.f_grid = np.array([1e14, 5e13, 2.5e13])  # 3 test frequencies
-ws.abs_species = ["H2O, H2O-SelfContCKDMT350, H2O-ForeignContCKDMT350"]
-ws.propmat_clearsky_agendaAuto()
-
-pyarts.cat.download.retrieve()
-ws.atm = pyarts.arts.AtmField.fromMeanState(ws.f_grid, toa=100e3, nlay=10)
-
-# These are the calls that may need adjustment:
-z_grid = np.array(ws.atm.grid("z"))
-T_grid = np.array(ws.atm["t"])
-p_grid = np.array(ws.atm["p"])
-print(f"z_grid shape: {z_grid.shape}, range: {z_grid[0]:.0f}–{z_grid[-1]:.0f} m")
-print(f"T_grid shape: {T_grid.shape}")
-
-# Test propmat extraction at one layer
-z_mid = 0.5 * (z_grid[0] + z_grid[1])
-ws.atm_point = pyarts.arts.AtmPoint(ws.atm, z_mid)
-ws.propmat_clearskyInit()
-ws.propmat_clearskyAddFromLookup()  # or propmat_clearskyAddLines, etc.
-pm = np.array(ws.propmat_clearsky)
-print(f"propmat shape: {pm.shape}")
-print(f"absorption coeff [1/m]: {pm[:, 0, 0]}")
-```
-
-If any calls fail, adjust `_compute_layer_optics` in `lut.py` accordingly. The key outputs needed are:
-- Absorption coefficient κ(z, λ) in [1/m] at each layer
-- Temperature T(z), altitude z, pressure p at each layer
+- **Atmosphere**: `ws.p_grid`, `ws.t_field` (Tensor3), `ws.z_field` (Tensor3), `ws.vmr_field` (Tensor4) — *not* `AtmField`
+- **Propmat at a point**: `ws.rtp_pressure/temperature/vmr/mag/los/nlte` → `propmat_clearskyInit()` + `propmat_clearskyAddFromLookup()`
+- **Extract kappa**: `np.array(ws.propmat_clearsky.value.data)` → shape `(1, 1, n_freq, 1)` → `[0, 0, :, 0]`
+- **Line catalogue**: Must call `abs_linesReadSpeciesSplitCatalog` + `abs_lines_per_speciesCreateFromLines` before `propmat_clearsky_agendaAuto()`
+- **Species tags**: Updated to `CKDMT400` continua to match atmgen LUTs
+- **Fast path**: Can load pre-built `abs_lookup` XML (from `~/.cache/atmgen/lut/`) via `ReadXML` + `abs_lookupAdapt` + `propmat_clearskyAddFromLookup`
 
 ## 2. Build a test LUT
 

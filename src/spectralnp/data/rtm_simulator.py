@@ -140,12 +140,10 @@ class ARTSSimulator:
             return
 
         import pyarts
+        from pathlib import Path
         from spectralnp.data.lut import ARTS_ABS_SPECIES
 
-        if self._arts_data_path:
-            pyarts.cat.download.retrieve(arts_data_path=self._arts_data_path)
-        else:
-            pyarts.cat.download.retrieve()
+        pyarts.cat.download.retrieve()
 
         self._ws = pyarts.Workspace()
         ws = self._ws
@@ -159,6 +157,23 @@ class ARTSSimulator:
 
         # All six trace gases + O₂/N₂ CIA for 0.3–16 μm.
         ws.abs_species = list(ARTS_ABS_SPECIES)
+
+        # Load spectral line catalogue (ARTS 2.6 API).
+        cat_base = Path.home() / ".cache" / "arts"
+        cat_dirs = sorted(cat_base.glob("arts-cat-data-*"))
+        if cat_dirs:
+            lines_dir = str(cat_dirs[-1] / "lines") + "/"
+        else:
+            raise RuntimeError(
+                "ARTS catalogue data not found in ~/.cache/arts/. "
+                "Run pyarts.cat.download.retrieve() first."
+            )
+        ws.abs_linesReadSpeciesSplitCatalog(basename=lines_dir, robust=1)
+        ws.abs_linesTurnOffLineMixing()
+        ws.abs_linesCutoff(option="ByLine", value=750e9)
+        ws.abs_lines_per_speciesCreateFromLines()
+        ws.propmat_clearsky_agendaAuto()
+        ws.jacobian_quantities = pyarts.arts.ArrayOfRetrievalQuantity()
 
     def simulate(
         self,
@@ -188,32 +203,64 @@ class ARTSSimulator:
         ws = self._ws
 
         import pyarts
+        from spectralnp.data.lut import ARTS_ABS_SPECIES
 
-        # --- Atmosphere setup ---
-        ws.atm = pyarts.arts.AtmField.fromMeanState(
-            ws.f_grid,
-            toa=100e3,
-            nlay=50,
+        # --- Atmosphere setup (ARTS 2.6 API) ---
+        n_levels = 51
+        z_surface = atmos.surface_altitude_km * 1e3
+        z_grid = np.linspace(z_surface, 100e3, n_levels)
+        T_profile = np.where(
+            z_grid < 11e3, 288.15 - 6.5e-3 * z_grid,
+            np.where(z_grid < 20e3, 216.65,
+                     np.where(z_grid < 32e3, 216.65 + 1e-3 * (z_grid - 20e3),
+                              228.65)))
+        T_profile = np.clip(T_profile, 180.0, 320.0)
+        p_profile = 101325.0 * np.exp(-z_grid / 8500.0)
+
+        p_sorted = np.sort(p_profile)[::-1]
+        sort_idx = np.argsort(p_profile)[::-1]
+
+        ws.p_grid = p_sorted
+        ws.lat_grid = np.array([])
+        ws.lon_grid = np.array([])
+        ws.t_field = pyarts.arts.Tensor3(
+            T_profile[sort_idx].reshape(-1, 1, 1)
         )
+        ws.z_field = pyarts.arts.Tensor3(
+            z_grid[sort_idx].reshape(-1, 1, 1)
+        )
+        ws.z_surface = pyarts.arts.Matrix(np.array([[z_surface]]))
 
-        # Scale gas profiles.
+        n_sp = len(ARTS_ABS_SPECIES)
+        vmr = np.zeros((n_sp, n_levels, 1, 1))
+        z_sorted = z_grid[sort_idx]
+        vmr[0] = 0.01 * np.exp(-z_sorted.reshape(-1, 1, 1) / 2000.0)
+        vmr[1] = 400e-6
+        vmr[2] = 3e-6
+        vmr[3] = 332e-9
+        vmr[4] = 1800e-9
+        vmr[5] = 120e-9
+        vmr[6] = 0.21
+        vmr[7] = 0.78
+
         _REF = {
-            "water_vapour": ("H2O", 1.5),
-            "ozone_du": ("O3", 300.0),
-            "co2_ppmv": ("CO2", 400.0),
-            "ch4_ppbv": ("CH4", 1800.0),
-            "n2o_ppbv": ("N2O", 332.0),
-            "co_ppbv": ("CO", 120.0),
+            "water_vapour": (0, 1.5),
+            "ozone_du": (2, 300.0),
+            "co2_ppmv": (1, 400.0),
+            "ch4_ppbv": (4, 1800.0),
+            "n2o_ppbv": (3, 332.0),
+            "co_ppbv": (5, 120.0),
         }
-        for attr_name, (species, ref_val) in _REF.items():
+        for attr_name, (sp_idx, ref_val) in _REF.items():
             val = getattr(atmos, attr_name)
             if val != ref_val:
-                ws.atm[species] = ws.atm[species] * (val / ref_val)
+                vmr[sp_idx] *= val / ref_val
+
+        ws.vmr_field = pyarts.arts.Tensor4(vmr)
 
         # --- Surface ---
         ws.surface_type = "Lambertian"
         ws.surface_reflectivity = surface_reflectance.reshape(-1, 1, 1)
-        ws.z_surface = np.array([[atmos.surface_altitude_km * 1e3]])
 
         # Surface skin temperature for thermal emission.
         if atmos.surface_temperature_k is not None:
@@ -231,7 +278,10 @@ class ARTSSimulator:
         )
 
         # --- Run RT calculation ---
-        ws.propmat_clearsky_agendaAuto()
+        ws.lbl_checkedCalc()
+        ws.propmat_clearsky_agenda_checkedCalc()
+        ws.atmfields_checkedCalc()
+        ws.atmgeom_checkedCalc()
         ws.iy_main_agendaFromPath()
         ws.ppath_agendaFromGeometric()
 
@@ -239,7 +289,7 @@ class ARTSSimulator:
 
         # Extract radiance.  ARTS outputs Stokes-I in W/(m² Hz sr).
         # Convert to W/(m² sr μm) using: L_λ = L_ν · c / λ²
-        y_wm2_hz_sr = np.array(ws.y).flatten()
+        y_wm2_hz_sr = np.array(ws.y.value).flatten()
         lambda_m = self.wavelength_m
         toa_radiance_wm2_sr_um = y_wm2_hz_sr * _C / (lambda_m**2) * 1e-6
 
