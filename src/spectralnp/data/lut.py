@@ -48,15 +48,16 @@ _K = 1.380649e-23  # Boltzmann constant  [J K⁻¹]
 _SOLAR_OMEGA = 6.794e-5  # solar disk solid angle  [sr]
 
 # Gas species for ARTS spanning 0.3–16 μm.
+# Tags match the CKD MT 4.0 continua used by the atmgen LUT builder.
 ARTS_ABS_SPECIES = [
-    "H2O, H2O-SelfContCKDMT350, H2O-ForeignContCKDMT350",
-    "CO2, CO2-CKDMT252",
+    "H2O, H2O-SelfContCKDMT400, H2O-ForeignContCKDMT400",
+    "CO2",
     "O3",
     "N2O",
     "CH4",
     "CO",
-    "O2-CIAfunCKDMT100",
-    "N2-CIAfunCKDMT252, N2-CIArotCKDMT252",
+    "O2",
+    "N2",
 ]
 
 
@@ -198,9 +199,9 @@ class LUTConfig:
 
 def _lut_worker(args):
     """Compute layer optical depths for one atmospheric state (multiprocessing)."""
-    config, atmos_idx, atmos_vals, arts_data_path = args
-    gen = ARTSLUTGenerator(config, arts_data_path)
-    ws = gen._init_arts()
+    config, atmos_idx, atmos_vals, arts_data_path, abs_lookup_path = args
+    gen = ARTSLUTGenerator(config, arts_data_path, abs_lookup_path)
+    ws = gen._init_arts(abs_lookup_path=abs_lookup_path)
     tau, T_layer, z_layer, p_layer = gen._compute_layer_optics(ws, atmos_vals)
     return atmos_idx, tau, T_layer, z_layer, p_layer
 
@@ -225,55 +226,150 @@ class ARTSLUTGenerator:
         self,
         config: LUTConfig | None = None,
         arts_data_path: str | None = None,
+        abs_lookup_path: str | None = None,
     ):
         self.config = config or LUTConfig()
         self._arts_data_path = arts_data_path
+        self._abs_lookup_path = abs_lookup_path
 
-    def _init_arts(self):
-        """Create and return a fresh ARTS workspace for 0.3–16 μm."""
+    def _init_arts(self, abs_lookup_path: str | None = None):
+        """Create and return a fresh ARTS workspace for 0.3–16 μm.
+
+        Parameters
+        ----------
+        abs_lookup_path : str, optional
+            Path to an existing ARTS ``abs_lookup`` XML file (e.g. from
+            ``atmgen``).  When provided the lookup table is loaded and
+            ``propmat_clearskyAddFromLookup`` is used instead of
+            line-by-line, which is dramatically faster.
+        """
         import pyarts
 
-        if self._arts_data_path:
-            pyarts.cat.download.retrieve(arts_data_path=self._arts_data_path)
-        else:
-            pyarts.cat.download.retrieve()
+        pyarts.cat.download.retrieve()
 
         ws = pyarts.Workspace()
         ws.atmosphere_dim = 1
         ws.stokes_dim = 1
 
-        wl_m = self.config.wavelength_nm * 1e-9
-        freq_hz = _C / wl_m
-        ws.f_grid = np.sort(freq_hz)[::-1].copy()
-
         ws.abs_species = list(ARTS_ABS_SPECIES)
-        ws.propmat_clearsky_agendaAuto()
+
+        if abs_lookup_path is not None:
+            # ---- fast path: pre-built absorption lookup table ----
+            ws.ReadXML(ws.abs_lookup, str(abs_lookup_path))
+            ws.f_gridFromGasAbsLookup()
+            ws.abs_lookupAdapt()
+
+            @pyarts.workspace.arts_agenda
+            def propmat_clearsky_agenda(ws):
+                ws.Ignore(ws.rtp_mag)
+                ws.Ignore(ws.rtp_los)
+                ws.Ignore(ws.rtp_nlte)
+                ws.propmat_clearskyInit()
+                ws.propmat_clearskyAddFromLookup()
+
+            ws.propmat_clearsky_agenda = propmat_clearsky_agenda
+        else:
+            # ---- slow path: line-by-line ----
+            wl_m = self.config.wavelength_nm * 1e-9
+            freq_hz = _C / wl_m
+            ws.f_grid = np.sort(freq_hz)[::-1].copy()
+
+            cat_base = Path.home() / ".cache" / "arts"
+            cat_dirs = sorted(cat_base.glob("arts-cat-data-*"))
+            if cat_dirs:
+                lines_dir = str(cat_dirs[-1] / "lines") + "/"
+            else:
+                raise RuntimeError(
+                    "ARTS catalogue data not found in ~/.cache/arts/. "
+                    "Run pyarts.cat.download.retrieve() first."
+                )
+            ws.abs_linesReadSpeciesSplitCatalog(basename=lines_dir, robust=1)
+            ws.abs_linesTurnOffLineMixing()
+            ws.abs_linesCutoff(option="ByLine", value=750e9)
+            ws.abs_lines_per_speciesCreateFromLines()
+            ws.propmat_clearsky_agendaAuto()
+
+        ws.jacobian_quantities = pyarts.arts.ArrayOfRetrievalQuantity()
+        ws.propmat_clearsky_agenda_checkedCalc()
 
         return ws
 
     def _setup_atmosphere(self, ws, atmos_vals: dict[str, float]):
-        """Configure the 1-D atmosphere and scale gas profiles."""
+        """Configure the 1-D atmosphere and scale gas profiles.
+
+        Builds a US-Standard-like atmosphere on *n_layers + 1* levels from
+        the surface altitude to ``toa_m``, then sets the ARTS workspace
+        variables ``p_grid``, ``t_field``, ``z_field``, ``vmr_field``, and
+        ``z_surface``.
+        """
         import pyarts
 
-        ws.atm = pyarts.arts.AtmField.fromMeanState(
-            ws.f_grid, toa=self.config.toa_m, nlay=self.config.n_layers
-        )
+        n_levels = self.config.n_layers + 1
+        alt_km = atmos_vals.get("surface_altitude_km", 0.0)
+        z_surface = alt_km * 1e3  # m
 
+        # Altitude grid from surface to TOA.
+        z_grid = np.linspace(z_surface, self.config.toa_m, n_levels)
+
+        # US Standard temperature profile (simplified).
+        T_profile = np.where(
+            z_grid < 11e3, 288.15 - 6.5e-3 * z_grid,
+            np.where(z_grid < 20e3, 216.65,
+                     np.where(z_grid < 32e3, 216.65 + 1e-3 * (z_grid - 20e3),
+                              228.65)))
+        T_profile = np.clip(T_profile, 180.0, 320.0)
+
+        # Hydrostatic pressure.
+        p_profile = 101325.0 * np.exp(-z_grid / 8500.0)
+
+        # ARTS wants *descending* pressure (p[0] is highest = ground).
+        p_sorted = np.sort(p_profile)[::-1]
+        sort_idx = np.argsort(p_profile)[::-1]
+
+        ws.p_grid = p_sorted
+        ws.lat_grid = np.array([])
+        ws.lon_grid = np.array([])
+        ws.t_field = pyarts.arts.Tensor3(
+            T_profile[sort_idx].reshape(-1, 1, 1)
+        )
+        ws.z_field = pyarts.arts.Tensor3(
+            z_grid[sort_idx].reshape(-1, 1, 1)
+        )
+        ws.z_surface = pyarts.arts.Matrix(np.array([[z_surface]]))
+
+        # VMR profiles (n_species, n_levels, 1, 1).
+        n_sp = len(ARTS_ABS_SPECIES)
+        vmr = np.zeros((n_sp, n_levels, 1, 1))
+        z_sorted = z_grid[sort_idx]
+
+        # Reference VMR profiles — simple altitude-dependent models.
+        vmr[0] = 0.01 * np.exp(-z_sorted.reshape(-1, 1, 1) / 2000.0)  # H2O
+        vmr[1] = 400e-6    # CO2
+        vmr[2] = 3e-6      # O3 (rough average)
+        vmr[3] = 332e-9    # N2O
+        vmr[4] = 1800e-9   # CH4
+        vmr[5] = 120e-9    # CO
+        vmr[6] = 0.21      # O2
+        vmr[7] = 0.78      # N2
+
+        # Scale gases relative to reference values.
         _REF = {
-            "water_vapour": ("H2O", 1.5),
-            "ozone_du": ("O3", 300.0),
-            "co2_ppmv": ("CO2", 400.0),
-            "ch4_ppbv": ("CH4", 1800.0),
-            "n2o_ppbv": ("N2O", 332.0),
-            "co_ppbv": ("CO", 120.0),
+            "water_vapour": (0, 1.5),
+            "ozone_du": (2, 300.0),
+            "co2_ppmv": (1, 400.0),
+            "ch4_ppbv": (4, 1800.0),
+            "n2o_ppbv": (3, 332.0),
+            "co_ppbv": (5, 120.0),
         }
-        for key, (species, ref_val) in _REF.items():
+        for key, (sp_idx, ref_val) in _REF.items():
             val = atmos_vals.get(key, ref_val)
             if val != ref_val:
-                ws.atm[species] = ws.atm[species] * (val / ref_val)
+                vmr[sp_idx] *= val / ref_val
 
-        alt_km = atmos_vals.get("surface_altitude_km", 0.0)
-        ws.z_surface = np.array([[alt_km * 1e3]])
+        ws.vmr_field = pyarts.arts.Tensor4(vmr)
+
+        # Store sorted indices on the workspace for _compute_layer_optics.
+        self._sort_idx = sort_idx
 
     def _compute_layer_optics(
         self, ws, atmos_vals: dict[str, float]
@@ -291,37 +387,39 @@ class ARTSLUTGenerator:
 
         self._setup_atmosphere(ws, atmos_vals)
 
-        n_wl = len(self.config.wavelength_nm)
+        # Read grids back from workspace (ARTS 2.6 Tensor3/4 fields).
+        p_grid = np.array(ws.p_grid.value)
+        t_field = np.array(ws.t_field.value).squeeze()  # (n_levels,)
+        z_field = np.array(ws.z_field.value).squeeze()  # (n_levels,)
+        vmr_field = np.array(ws.vmr_field.value)  # (n_sp, n_levels, 1, 1)
 
-        # Extract the atmospheric grid from the AtmField.
-        atm = ws.atm
-        z_grid = np.array(atm.grid("z"))  # altitude grid [m]
-        T_grid = np.array(atm["t"])  # temperature [K]
-        p_grid = np.array(atm["p"])  # pressure [Pa]
+        n_freq = len(np.array(ws.f_grid.value))
 
         # Layer centres: midpoints between grid levels.
-        z_layers = 0.5 * (z_grid[:-1] + z_grid[1:])
-        T_layers = 0.5 * (T_grid[:-1] + T_grid[1:])
+        z_layers = 0.5 * (z_field[:-1] + z_field[1:])
+        T_layers = 0.5 * (t_field[:-1] + t_field[1:])
         p_layers = np.sqrt(p_grid[:-1] * p_grid[1:])  # geometric mean
-        dz = np.abs(z_grid[1:] - z_grid[:-1])  # layer thickness [m]
+        dz = np.abs(z_field[1:] - z_field[:-1])  # layer thickness [m]
 
-        # Compute absorption coefficients at each layer.
-        # propmat_clearsky gives the propagation matrix (absorption + scattering)
-        # at specified (f, T, p, VMR).
-        tau_layers = np.zeros((len(z_layers), n_wl), dtype=np.float64)
+        n_layers = len(z_layers)
+        tau_layers = np.zeros((n_layers, n_freq), dtype=np.float64)
 
-        for i in range(len(z_layers)):
+        for i in range(n_layers):
             # Set atmospheric point for this layer.
-            ws.atm_point = pyarts.arts.AtmPoint(atm, z_layers[i])
+            ws.rtp_pressure = float(p_layers[i])
+            ws.rtp_temperature = float(T_layers[i])
+            ws.rtp_vmr = vmr_field[:, i, 0, 0].copy()
+            ws.rtp_mag = np.array([0.0, 0.0, 0.0])
+            ws.rtp_los = np.array([0.0, 0.0])
+            ws.rtp_nlte = pyarts.arts.EnergyLevelMap()
 
             # Compute propagation matrix at all frequencies.
             ws.propmat_clearskyInit()
-            ws.propmat_clearskyAddFromLookup()  # or Auto depending on setup
+            ws.propmat_clearskyAddFromLookup()
 
-            # Extract absorption coefficient [1/m] from propagation matrix.
-            # propmat_clearsky is (n_freq, stokes, stokes) → take [i,0,0].
-            pm = np.array(ws.propmat_clearsky)
-            kappa = pm[:, 0, 0]  # absorption coefficient [1/m]
+            # PropagationMatrix.data is Tensor4 (stokes, stokes, n_freq, 1).
+            pm = np.array(ws.propmat_clearsky.value.data)
+            kappa = pm[0, 0, :, 0]  # absorption coefficient [1/m]
 
             # Optical depth = κ · Δz  (vertical, nadir).
             tau_layers[i, :] = kappa * dz[i]
@@ -367,14 +465,15 @@ class ARTSLUTGenerator:
                 name: float(grid[i])
                 for name, grid, i in zip(atmos_axis_names, atmos_grids, idx)
             }
-            jobs.append((cfg, idx, vals, self._arts_data_path))
+            jobs.append((cfg, idx, vals, self._arts_data_path,
+                         self._abs_lookup_path))
 
         total = len(jobs)
         done = 0
 
         if n_workers <= 1:
-            ws = self._init_arts()
-            for _, atmos_idx, vals, _ in jobs:
+            ws = self._init_arts(abs_lookup_path=self._abs_lookup_path)
+            for _, atmos_idx, vals, _, _ in jobs:
                 tau, T_lay, z_lay, p_lay = self._compute_layer_optics(ws, vals)
                 tau_all[atmos_idx] = tau
                 T_all[atmos_idx] = T_lay

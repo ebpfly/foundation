@@ -59,6 +59,13 @@ def main():
         help="Path to ARTS spectroscopic data.",
     )
     parser.add_argument(
+        "--abs-lookup",
+        type=str,
+        default=None,
+        help="Path to an ARTS abs_lookup XML file (from atmgen) for fast "
+             "propmat computation instead of line-by-line.",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
         help="Use a coarse grid for quick testing.",
@@ -96,7 +103,9 @@ def main():
     log.info("Layers: %d", cfg.n_layers)
     log.info("Workers: %d", args.workers)
 
-    gen = ARTSLUTGenerator(cfg, arts_data_path=args.arts_data)
+    gen = ARTSLUTGenerator(
+        cfg, arts_data_path=args.arts_data, abs_lookup_path=args.abs_lookup
+    )
 
     t0 = time.perf_counter()
     gen.generate(args.output, n_workers=args.workers)
