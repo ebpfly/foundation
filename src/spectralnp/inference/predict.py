@@ -20,9 +20,13 @@ from spectralnp.model.spectralnp import SpectralNP, SpectralNPConfig
 class SpectralPrediction:
     """Full prediction with uncertainty from SpectralNP."""
 
-    # Spectral reconstruction.
+    # Spectral reconstruction (at-sensor radiance).
     spectral_mean: np.ndarray | None = None    # (Q,) or (B, Q)
     spectral_std: np.ndarray | None = None     # (Q,) or (B, Q)
+
+    # Surface reflectance reconstruction.
+    reflectance_mean: np.ndarray | None = None # (Q,) or (B, Q)
+    reflectance_std: np.ndarray | None = None  # (Q,) or (B, Q)
 
     # Material probabilities.
     material_probs: np.ndarray | None = None   # (C,) or (B, C)
@@ -108,6 +112,9 @@ class SpectralNPPredictor:
         if "spectral_mean" in results:
             pred.spectral_mean = results["spectral_mean"][0].cpu().numpy()
             pred.spectral_std = results["spectral_std"][0].cpu().numpy()
+        if "reflectance_mean" in results:
+            pred.reflectance_mean = results["reflectance_mean"][0].cpu().numpy()
+            pred.reflectance_std = results["reflectance_std"][0].cpu().numpy()
         if "material_probs" in results:
             pred.material_probs = results["material_probs"][0].cpu().numpy()
             pred.material_entropy = results["material_entropy"][0].cpu().numpy()
@@ -166,6 +173,9 @@ class SpectralNPPredictor:
         if "spectral_mean" in results:
             pred.spectral_mean = results["spectral_mean"].cpu().numpy()
             pred.spectral_std = results["spectral_std"].cpu().numpy()
+        if "reflectance_mean" in results:
+            pred.reflectance_mean = results["reflectance_mean"].cpu().numpy()
+            pred.reflectance_std = results["reflectance_std"].cpu().numpy()
         if "material_probs" in results:
             pred.material_probs = results["material_probs"].cpu().numpy()
             pred.material_entropy = results["material_entropy"].cpu().numpy()

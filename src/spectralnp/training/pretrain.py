@@ -91,6 +91,7 @@ def train_one_epoch(
         pad_mask = batch["pad_mask"].to(device)
         target_wl = batch["target_wavelength"].to(device)
         target_rad = batch["target_radiance"].to(device)
+        target_refl = batch["target_reflectance"].to(device)
         target_atmos = batch["atmos_params"].to(device)
         material_idx = batch["material_idx"].to(device)
 
@@ -125,6 +126,7 @@ def train_one_epoch(
         losses = loss_fn(
             output,
             target_radiance=target_rad,
+            target_reflectance=target_refl,
             target_atmos=target_atmos,
             target_material=material_idx,
             prior_mu=prior_mu,
@@ -230,6 +232,7 @@ def main() -> None:
             f"Epoch {epoch+1}/{args.epochs}  "
             f"loss={metrics['total']:.4f}  "
             f"spectral={metrics.get('spectral', 0):.4f}  "
+            f"reflectance={metrics.get('reflectance', 0):.4f}  "
             f"atmos={metrics.get('atmos', 0):.4f}  "
             f"kl={metrics.get('kl', 0):.4f}  "
             f"lr={lr:.2e}"
@@ -248,6 +251,7 @@ def main() -> None:
                 "optimiser_state_dict": optimiser.state_dict(),
                 "config": cfg,
                 "loss": best_loss,
+                "speclib_size": len(speclib),
             }, out_dir / "best.pt")
 
         if (epoch + 1) % 10 == 0:
@@ -256,6 +260,7 @@ def main() -> None:
                 "model_state_dict": model.state_dict(),
                 "optimiser_state_dict": optimiser.state_dict(),
                 "config": cfg,
+                "speclib_size": len(speclib),
             }, out_dir / f"epoch_{epoch+1}.pt")
 
     logger.info(f"Training complete. Best loss: {best_loss:.4f}")
