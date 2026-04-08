@@ -105,9 +105,35 @@ def atmospheric_loss(
     return nll + reg_weight * reg
 
 
-def material_loss(logits: Tensor, target: Tensor) -> Tensor:
-    """Cross-entropy for material classification."""
-    return F.cross_entropy(logits, target)
+def material_loss(
+    logits: Tensor,
+    target: Tensor,
+    class_weights: Tensor | None = None,
+) -> Tensor:
+    """Cross-entropy for material classification, optionally class-weighted.
+
+    USGS categories are highly imbalanced (~880 minerals vs ~11 coatings),
+    so unweighted CE collapses to predicting "minerals" all the time.
+    Pass per-class weights inversely proportional to category frequency.
+    """
+    return F.cross_entropy(logits, target, weight=class_weights)
+
+
+def calibration_loss(pred_mu: Tensor, pred_log_var: Tensor, target: Tensor) -> Tensor:
+    """Calibration regulariser: penalise mismatch between predicted variance
+    and the empirical squared error.
+
+    The standard heteroscedastic NLL has a known failure mode where the
+    optimum drives ``log_var`` toward -∞ for any near-perfect prediction.
+    This regulariser pulls ``log_var`` toward ``log((y-mu)^2)``, i.e. the
+    empirical squared error, which is what a well-calibrated Gaussian
+    should report.
+
+    Returns the mean absolute log-ratio.
+    """
+    sq_err = (target - pred_mu) ** 2 + 1e-8
+    log_sq_err = torch.log(sq_err)
+    return (pred_log_var - log_sq_err).abs().mean()
 
 
 class SpectralNPLoss(torch.nn.Module):
@@ -130,6 +156,8 @@ class SpectralNPLoss(torch.nn.Module):
         w_kl: float = 0.01,
         w_material: float = 0.1,
         w_evidence_reg: float = 0.01,
+        w_calibration: float = 0.0,
+        material_class_weights: Tensor | None = None,
     ) -> None:
         super().__init__()
         self.w_spectral = w_spectral
@@ -138,6 +166,12 @@ class SpectralNPLoss(torch.nn.Module):
         self.w_kl = w_kl
         self.w_material = w_material
         self.w_evidence_reg = w_evidence_reg
+        self.w_calibration = w_calibration
+        # Register so it moves with .to(device).
+        if material_class_weights is not None:
+            self.register_buffer("material_class_weights", material_class_weights)
+        else:
+            self.material_class_weights = None
 
     def forward(
         self,
@@ -160,12 +194,20 @@ class SpectralNPLoss(torch.nn.Module):
             losses["spectral"] = spectral_reconstruction_loss(
                 output.spectral_mu, output.spectral_log_var, target_radiance
             )
+            if self.w_calibration > 0:
+                losses["spectral_calib"] = calibration_loss(
+                    output.spectral_mu, output.spectral_log_var, target_radiance
+                )
 
         # Surface reflectance reconstruction.
         if output.reflectance_mu is not None and target_reflectance is not None:
             losses["reflectance"] = spectral_reconstruction_loss(
                 output.reflectance_mu, output.reflectance_log_var, target_reflectance
             )
+            if self.w_calibration > 0:
+                losses["reflectance_calib"] = calibration_loss(
+                    output.reflectance_mu, output.reflectance_log_var, target_reflectance
+                )
 
         # Atmospheric parameters.
         if output.atmos_gamma is not None:
@@ -187,7 +229,10 @@ class SpectralNPLoss(torch.nn.Module):
 
         # Material classification.
         if self.w_material > 0 and target_material is not None and output.material_logits is not None:
-            losses["material"] = material_loss(output.material_logits, target_material)
+            losses["material"] = material_loss(
+                output.material_logits, target_material,
+                class_weights=self.material_class_weights,
+            )
 
         # Weighted total.
         total = torch.tensor(0.0, device=target_radiance.device)
@@ -195,6 +240,10 @@ class SpectralNPLoss(torch.nn.Module):
             total = total + self.w_spectral * losses["spectral"]
         if "reflectance" in losses:
             total = total + self.w_reflectance * losses["reflectance"]
+        if "spectral_calib" in losses:
+            total = total + self.w_calibration * losses["spectral_calib"]
+        if "reflectance_calib" in losses:
+            total = total + self.w_calibration * losses["reflectance_calib"]
         if "atmos" in losses:
             total = total + self.w_atmos * losses["atmos"]
         if "kl" in losses:

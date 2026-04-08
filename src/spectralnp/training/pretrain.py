@@ -78,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="KL weight (default 0.001 — was 0.01 which caused "
                          "collapse on real ARTS data; lower is safer).")
     p.add_argument("--w-material", type=float, default=0.1)
+    p.add_argument("--w-calibration", type=float, default=0.0,
+                    help="Weight on the calibration regulariser that pulls "
+                         "predicted variance toward empirical squared error. "
+                         "Set >0 to fix overconfident uncertainty.")
+    p.add_argument("--no-class-balance", action="store_true",
+                    help="Disable class-balanced material loss "
+                         "(default: enabled when --abs-lookup is used).")
     p.add_argument("--wl-min-nm", type=float, default=None,
                     help="Min wavelength of the dense reconstruction grid (nm). "
                          "Default: 380 nm (or 300 nm if --abs-lookup is set).")
@@ -283,16 +290,33 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
 
     # Loss.
+    # Class-balanced material loss: weights inversely proportional to category size.
+    class_weights = None
+    if not args.no_class_balance:
+        counts = np.bincount(
+            dataset.category_id_by_spec, minlength=dataset.n_material_classes
+        ).astype(np.float64)
+        # Inverse frequency, normalised to mean=1.
+        weights = (counts.sum() / np.maximum(counts, 1)) / dataset.n_material_classes
+        class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+        weights_str = ", ".join(
+            f"{n}={w:.2f}" for n, w in zip(dataset.category_names, weights)
+        )
+        logger.info(f"Class weights: {weights_str}")
+
     loss_fn = SpectralNPLoss(
         w_spectral=args.w_spectral,
         w_reflectance=args.w_reflectance,
         w_atmos=args.w_atmos,
         w_kl=args.w_kl,
         w_material=args.w_material,
-    )
+        w_calibration=args.w_calibration,
+        material_class_weights=class_weights,
+    ).to(device)
     logger.info(
         f"Loss weights: spectral={args.w_spectral} reflectance={args.w_reflectance} "
-        f"atmos={args.w_atmos} kl={args.w_kl} material={args.w_material}"
+        f"atmos={args.w_atmos} kl={args.w_kl} material={args.w_material} "
+        f"calibration={args.w_calibration}"
     )
 
     # Optional W&B.
