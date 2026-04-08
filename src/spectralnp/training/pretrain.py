@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Path to ARTS abs_lookup XML file (from atmgen). "
                          "Enables real ARTS line-by-line gas absorption with "
                          "per-atmosphere caching. Forces num-workers=0.")
+    p.add_argument("--wl-min-nm", type=float, default=None,
+                    help="Min wavelength of the dense reconstruction grid (nm). "
+                         "Default: 380 nm (or 300 nm if --abs-lookup is set).")
+    p.add_argument("--wl-max-nm", type=float, default=None,
+                    help="Max wavelength of the dense reconstruction grid (nm). "
+                         "Default: 2500 nm (or 16000 nm if --abs-lookup is set).")
     # KL annealing.
     p.add_argument("--kl-warmup-epochs", type=int, default=10,
                     help="Linearly anneal KL weight from 0 to target over this many epochs")
@@ -187,9 +193,27 @@ def main() -> None:
             logger.info("Forcing --num-workers=0 because abs_lookup is in use")
             args.num_workers = 0
 
+    # Dense reconstruction grid. Default to VNIR/SWIR; if abs_lookup is set,
+    # default to the full 0.3–16 μm variable-resolution grid from lut.py.
+    if args.abs_lookup is not None:
+        from spectralnp.data.lut import make_lut_wavelength_grid
+        wl_min = args.wl_min_nm if args.wl_min_nm is not None else 300.0
+        wl_max = args.wl_max_nm if args.wl_max_nm is not None else 16000.0
+        dense_wl = make_lut_wavelength_grid(wl_min=wl_min, wl_max=wl_max)
+        logger.info(
+            f"Full-spectrum dense grid: {wl_min:.0f}–{wl_max:.0f} nm, "
+            f"{len(dense_wl)} points (variable resolution)"
+        )
+    else:
+        wl_min = args.wl_min_nm if args.wl_min_nm is not None else 380.0
+        wl_max = args.wl_max_nm if args.wl_max_nm is not None else 2500.0
+        dense_wl = np.arange(wl_min, wl_max + 1.0, 5.0)
+        logger.info(f"Dense grid: {wl_min:.0f}–{wl_max:.0f} nm, {len(dense_wl)} points @ 5 nm")
+
     # Dataset.
     dataset = SpectralNPDataset(
         spectral_library=speclib,
+        dense_wavelength_nm=dense_wl,
         samples_per_epoch=args.samples_per_epoch,
         n_bands_range=(args.min_bands, args.max_bands),
         lut_path=args.lut_path,
