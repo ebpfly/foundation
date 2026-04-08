@@ -139,13 +139,13 @@ def diagnose(
         if not all(is_finite(getattr(m, f)) for f in ("loss", "spectral", "kl")):
             return ("nan", f"epoch {m.epoch} contains NaN/Inf")
 
-    # Diverging: spectral OR reflectance loss grew by ≥3× from post-warmup minimum.
-    spectral_history = [m.spectral for m in post_warmup]
-    min_spectral = min(spectral_history)
-    if min_spectral > 0 and last.spectral > min_spectral * 3.0:
+    # Diverging: total loss grew by ≥3× from post-warmup minimum.
+    loss_history = [m.loss for m in post_warmup]
+    min_loss = min(loss_history)
+    if min_loss > 0 and last.loss > min_loss * 3.0:
         return ("diverging",
-                f"epoch {last.epoch} spectral={last.spectral:.4g} >> "
-                f"min={min_spectral:.4g} (×{last.spectral/min_spectral:.1f})")
+                f"epoch {last.epoch} loss={last.loss:.4g} >> "
+                f"min={min_loss:.4g} (×{last.loss/min_loss:.1f})")
 
     # Reflectance NLL can be negative (well-calibrated Gaussian), so use
     # the absolute swing relative to min: if it grew by 5+ from its min
@@ -158,15 +158,17 @@ def diagnose(
                 f"epoch {last.epoch} reflectance={last.reflectance:.4g} "
                 f"(min was {min_refl:.4g}, swing +{swing:.2f})")
 
-    # Stalled: spectral loss hasn't improved in the last `stall_window` epochs
+    # Stalled: total loss hasn't improved in the last `stall_window` epochs
+    # (NB: we look at total, not spectral, because the spectral term may
+    # plateau at the log_var clamp while reflectance keeps improving)
     if len(post_warmup) >= stall_window:
         recent = post_warmup[-stall_window:]
-        recent_min = min(m.spectral for m in recent)
-        baseline = post_warmup[-stall_window].spectral
+        recent_min = min(m.loss for m in recent)
+        baseline = post_warmup[-stall_window].loss
         improvement = (baseline - recent_min) / max(abs(baseline), 1e-12)
         if improvement < 0.005:  # less than 0.5% improvement over the window
             return ("stalled",
-                    f"epoch {last.epoch} spectral stuck near {recent_min:.4g} "
+                    f"epoch {last.epoch} total loss stuck near {recent_min:.4g} "
                     f"(no improvement over last {stall_window} epochs)")
 
     return ("ok",
