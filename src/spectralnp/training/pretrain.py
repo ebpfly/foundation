@@ -54,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lut-path", type=str, default=None,
                     help="Path to pre-computed HDF5 layer-optical-depth LUT "
                          "(from build_lut.py). Enables fast LUT-based RTM.")
+    p.add_argument("--abs-lookup", type=str, default=None,
+                    help="Path to ARTS abs_lookup XML file (from atmgen). "
+                         "Enables real ARTS line-by-line gas absorption with "
+                         "per-atmosphere caching. Forces num-workers=0.")
     # KL annealing.
     p.add_argument("--kl-warmup-epochs", type=int, default=10,
                     help="Linearly anneal KL weight from 0 to target over this many epochs")
@@ -172,12 +176,24 @@ def main() -> None:
         raise RuntimeError("No spectra with full 380-2400 nm coverage found. "
                            "Check your USGS data path.")
 
+    # Optional ARTS abs_lookup simulator.
+    arts_sim = None
+    if args.abs_lookup is not None:
+        from spectralnp.data.rtm_simulator import ARTSLookupSimulator
+        logger.info(f"Loading ARTS abs_lookup from {args.abs_lookup}")
+        arts_sim = ARTSLookupSimulator(args.abs_lookup)
+        # pyarts is not fork-safe; force single-process data loading.
+        if args.num_workers > 0:
+            logger.info("Forcing --num-workers=0 because abs_lookup is in use")
+            args.num_workers = 0
+
     # Dataset.
     dataset = SpectralNPDataset(
         spectral_library=speclib,
         samples_per_epoch=args.samples_per_epoch,
         n_bands_range=(args.min_bands, args.max_bands),
         lut_path=args.lut_path,
+        arts_simulator=arts_sim,
         seed=args.seed,
     )
     loader = DataLoader(
