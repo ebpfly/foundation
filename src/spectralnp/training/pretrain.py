@@ -188,6 +188,11 @@ def main() -> None:
         from spectralnp.data.rtm_simulator import ARTSLookupSimulator
         logger.info(f"Loading ARTS abs_lookup from {args.abs_lookup}")
         arts_sim = ARTSLookupSimulator(args.abs_lookup)
+        # Pre-populate the per-atmosphere τ cache so all subsequent samples
+        # are cache hits (no ARTS calls during training).
+        logger.info("Pre-populating ARTS τ cache (one-time, ~5 min)")
+        arts_sim.prepopulate(verbose=True)
+        logger.info(f"Cache populated: {len(arts_sim._cache)} entries")
         # pyarts is not fork-safe; force single-process data loading.
         if args.num_workers > 0:
             logger.info("Forcing --num-workers=0 because abs_lookup is in use")

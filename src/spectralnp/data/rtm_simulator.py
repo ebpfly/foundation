@@ -516,6 +516,74 @@ class ARTSLookupSimulator:
         self._cache[key] = result
         return result
 
+    def prepopulate(
+        self,
+        water_vapour_grid: list[float] | None = None,
+        ozone_grid: list[float] | None = None,
+        surface_altitude_grid: list[float] | None = None,
+        co2_ppmv: float = 425.0,
+        ch4_ppbv: float = 1900.0,
+        n2o_ppbv: float = 332.0,
+        co_ppbv: float = 150.0,
+        verbose: bool = True,
+    ) -> None:
+        """Compute and cache τ for the full cartesian product of axes.
+
+        After calling this, every subsequent ``get_tau()`` call is a cache
+        hit (zero ARTS calls during training).
+        """
+        import itertools
+        import time
+
+        # Use bucket centres that round to themselves under self._atmos_key.
+        if water_vapour_grid is None:
+            water_vapour_grid = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        if ozone_grid is None:
+            ozone_grid = [200.0, 300.0, 400.0, 500.0]
+        if surface_altitude_grid is None:
+            surface_altitude_grid = [0.0, 1.0, 2.0, 3.0]
+
+        combos = list(itertools.product(
+            water_vapour_grid, ozone_grid, surface_altitude_grid,
+        ))
+        n = len(combos)
+
+        if verbose:
+            import sys
+            print(f"[ARTSLookupSimulator] pre-populating {n} cache entries...",
+                  flush=True, file=sys.stderr)
+
+        self._init_ws()
+        t0 = time.time()
+        for i, (wv, oz, alt) in enumerate(combos):
+            atmos = AtmosphericState(
+                water_vapour=wv,
+                ozone_du=oz,
+                co2_ppmv=co2_ppmv,
+                ch4_ppbv=ch4_ppbv,
+                n2o_ppbv=n2o_ppbv,
+                co_ppbv=co_ppbv,
+                surface_altitude_km=alt,
+            )
+            key = self._atmos_key(atmos)
+            if key in self._cache:
+                continue
+            self._cache[key] = self._compute_tau_layers(key)
+            if verbose and (i + 1) % 10 == 0:
+                import sys
+                elapsed = time.time() - t0
+                rate = (i + 1) / elapsed
+                eta = (n - i - 1) / rate
+                print(f"  [{i+1}/{n}] {elapsed:.0f}s elapsed, {eta:.0f}s remaining, "
+                      f"cache size {len(self._cache)}",
+                      flush=True, file=sys.stderr)
+
+        if verbose:
+            import sys
+            print(f"[ARTSLookupSimulator] pre-population complete: "
+                  f"{len(self._cache)} entries in {time.time()-t0:.0f}s",
+                  flush=True, file=sys.stderr)
+
     @property
     def cache_stats(self) -> dict:
         return {
