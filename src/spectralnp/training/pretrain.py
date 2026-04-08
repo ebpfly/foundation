@@ -58,6 +58,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Path to ARTS abs_lookup XML file (from atmgen). "
                          "Enables real ARTS line-by-line gas absorption with "
                          "per-atmosphere caching. Forces num-workers=0.")
+    p.add_argument("--n-atmospheres-per-epoch", type=int, default=10,
+                    help="When --abs-lookup is set: number of fresh random "
+                         "atmospheres computed at the start of each epoch. "
+                         "Each costs ~3 sec of ARTS work.")
+    p.add_argument("--n-scenes-per-epoch", type=int, default=10,
+                    help="When --abs-lookup is set: number of fresh "
+                         "(atmosphere, geometry, aerosol) scenes computed "
+                         "at the start of each epoch. Each is ~3 sec ARTS + "
+                         "a fast path-integration. Per-sample work then "
+                         "drops to ~1 ms (just the surface coupling).")
     p.add_argument("--wl-min-nm", type=float, default=None,
                     help="Min wavelength of the dense reconstruction grid (nm). "
                          "Default: 380 nm (or 300 nm if --abs-lookup is set).")
@@ -188,11 +198,7 @@ def main() -> None:
         from spectralnp.data.rtm_simulator import ARTSLookupSimulator
         logger.info(f"Loading ARTS abs_lookup from {args.abs_lookup}")
         arts_sim = ARTSLookupSimulator(args.abs_lookup)
-        # Pre-populate the per-atmosphere τ cache so all subsequent samples
-        # are cache hits (no ARTS calls during training).
-        logger.info("Pre-populating ARTS τ cache (one-time, ~5 min)")
-        arts_sim.prepopulate(verbose=True)
-        logger.info(f"Cache populated: {len(arts_sim._cache)} entries")
+        # Initial cache population happens at start of epoch 0 below.
         # pyarts is not fork-safe; force single-process data loading.
         if args.num_workers > 0:
             logger.info("Forcing --num-workers=0 because abs_lookup is in use")
@@ -265,7 +271,24 @@ def main() -> None:
 
     # Training loop.
     best_loss = float("inf")
+    arts_rng = np.random.default_rng(args.seed + 10000) if arts_sim is not None else None
     for epoch in range(args.epochs):
+        # Refresh ARTS scene cache once per epoch (scene-based fast path).
+        if arts_sim is not None:
+            import time as _t
+            t0 = _t.time()
+            scenes = arts_sim.populate_random_scenes(args.n_scenes_per_epoch, arts_rng)
+            logger.info(
+                f"Epoch {epoch+1}: refreshed {len(scenes)} scenes "
+                f"in {_t.time()-t0:.0f}s "
+                f"(WV {min(s['atmos'].water_vapour for s in scenes):.1f}-"
+                f"{max(s['atmos'].water_vapour for s in scenes):.1f} g/cm², "
+                f"AOD {min(s['atmos'].aod_550 for s in scenes):.2f}-"
+                f"{max(s['atmos'].aod_550 for s in scenes):.2f}, "
+                f"SZA {min(s['geometry'].solar_zenith_deg for s in scenes):.0f}-"
+                f"{max(s['geometry'].solar_zenith_deg for s in scenes):.0f}°)"
+            )
+
         # KL annealing.
         kl_weight = min(1.0, epoch / max(args.kl_warmup_epochs, 1))
 

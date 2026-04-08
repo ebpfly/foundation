@@ -359,6 +359,14 @@ class ARTSLookupSimulator:
         self._cache: dict[tuple, tuple[np.ndarray, ...]] = {}
         self._n_misses = 0
         self._n_hits = 0
+        # When set (by populate_random), the dataset should sample atmospheric
+        # parameters from this list rather than continuously.
+        self._available_states: list[tuple[float, float, float]] = []
+
+        # Scene-based fast path: each "scene" caches all RT pieces that
+        # depend only on (atmosphere, geometry, aod). The dataset draws a
+        # scene index per sample and combines it with (refl, T_s).
+        self._scenes: list[dict] = []
 
     # ------------------------------------------------------------------
     # Lazy init
@@ -506,7 +514,29 @@ class ARTSLookupSimulator:
         )
 
     def get_tau(self, atmos: AtmosphericState):
-        """Cached τ lookup for an atmospheric state."""
+        """Cached τ lookup for an atmospheric state.
+
+        Two modes:
+          - **random-per-epoch** (after ``populate_random``): the cache is
+            keyed by the exact ``(wv, oz, alt)`` tuple of the available
+            states. Other gas concentrations are fixed at the simulator's
+            defaults. Lookups are exact, no quantization.
+          - **quantized-grid** (after ``prepopulate``): the cache is keyed
+            by a quantized 7-tuple. Lookups round to the nearest bucket.
+        """
+        if self._available_states:
+            # Random-per-epoch mode: exact 3-tuple lookup.
+            key = (atmos.water_vapour, atmos.ozone_du, atmos.surface_altitude_km)
+            if key in self._cache:
+                self._n_hits += 1
+                return self._cache[key]
+            # Should not happen if dataset sampling is wired correctly.
+            self._n_misses += 1
+            result = self._compute_tau_for_random_state(*key)
+            self._cache[key] = result
+            return result
+
+        # Quantized-grid mode (used by prepopulate()).
         key = self._atmos_key(atmos)
         if key in self._cache:
             self._n_hits += 1
@@ -515,6 +545,226 @@ class ARTSLookupSimulator:
         result = self._compute_tau_layers(key)
         self._cache[key] = result
         return result
+
+    # ------------------------------------------------------------------
+    # Random-per-epoch mode
+    # ------------------------------------------------------------------
+
+    # Default gas concentrations used in random mode (other than wv/oz).
+    RANDOM_GAS_DEFAULTS = {
+        "co2_ppmv": 425.0,
+        "ch4_ppbv": 1900.0,
+        "n2o_ppbv": 332.0,
+        "co_ppbv": 150.0,
+    }
+
+    def _compute_tau_for_random_state(
+        self, water_vapour: float, ozone_du: float, surface_altitude_km: float
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Compute τ for a (wv, oz, alt) state with default other gases."""
+        atmos_key = (
+            water_vapour,
+            ozone_du,
+            self.RANDOM_GAS_DEFAULTS["co2_ppmv"],
+            self.RANDOM_GAS_DEFAULTS["ch4_ppbv"],
+            self.RANDOM_GAS_DEFAULTS["n2o_ppbv"],
+            self.RANDOM_GAS_DEFAULTS["co_ppbv"],
+            surface_altitude_km,
+        )
+        return self._compute_tau_layers(atmos_key)
+
+    def populate_random(
+        self,
+        n: int,
+        rng: np.random.Generator,
+        wv_range: tuple[float, float] = (0.2, 5.0),
+        oz_range: tuple[float, float] = (200.0, 500.0),
+        alt_range: tuple[float, float] = (0.0, 3.0),
+        verbose: bool = False,
+    ) -> list[tuple[float, float, float]]:
+        """Compute and cache τ for *n* random atmospheres.
+
+        Clears any previous cache + available-states. The dataset should
+        then sample only from the returned (wv, oz, alt) tuples.
+
+        Returns
+        -------
+        The list of ``(water_vapour, ozone_du, surface_altitude_km)`` tuples.
+        """
+        import time
+
+        self._cache.clear()
+        self._available_states = []
+        self._init_ws()
+
+        t0 = time.time()
+        for i in range(n):
+            wv = float(rng.uniform(*wv_range))
+            oz = float(rng.uniform(*oz_range))
+            alt = float(rng.uniform(*alt_range))
+            tau_data = self._compute_tau_for_random_state(wv, oz, alt)
+            self._cache[(wv, oz, alt)] = tau_data
+            self._available_states.append((wv, oz, alt))
+            if verbose:
+                import sys
+                print(f"  [{i+1}/{n}] wv={wv:.2f} oz={oz:.0f} alt={alt:.1f} "
+                      f"({time.time()-t0:.0f}s elapsed)",
+                      flush=True, file=sys.stderr)
+        return list(self._available_states)
+
+    def random_atmospheric_values(
+        self, rng: np.random.Generator
+    ) -> tuple[float, float, float]:
+        """Return one of the cached (wv, oz, alt) tuples uniformly at random."""
+        if not self._available_states:
+            raise RuntimeError(
+                "No available states. Call populate_random() first."
+            )
+        idx = int(rng.integers(0, len(self._available_states)))
+        return self._available_states[idx]
+
+    # ------------------------------------------------------------------
+    # Scene-based RT (atmosphere + geometry + aod fully precomputed;
+    # only surface reflectance and surface temperature stay per-sample)
+    # ------------------------------------------------------------------
+
+    def populate_random_scenes(
+        self,
+        n: int,
+        rng: np.random.Generator,
+        wv_range: tuple[float, float] = (0.2, 5.0),
+        oz_range: tuple[float, float] = (200.0, 500.0),
+        alt_range: tuple[float, float] = (0.0, 3.0),
+        sza_range: tuple[float, float] = (10.0, 70.0),
+        vza_range: tuple[float, float] = (0.0, 30.0),
+        raa_range: tuple[float, float] = (0.0, 180.0),
+        sensor_alt_choices: tuple[float, ...] = (20.0, 100.0, 400.0, 700.0, 800.0),
+        aod_range: tuple[float, float] = (0.01, 1.0),
+        verbose: bool = False,
+    ) -> list[dict]:
+        """Compute and cache *n* full RT scenes.
+
+        Each scene bundles a random atmosphere, geometry, and aerosol load
+        with all the precomputed RT pieces (``L_atm_total``, ``E_ground``,
+        ``T_up_total``, ``S_atm``).  Per-sample work is then just the
+        cheap surface coupling: one Planck call + a few elementwise ops.
+
+        Returns the list of scene dicts (each contains the AtmosphericState
+        and ViewGeometry it represents, plus the precomputed arrays).
+        """
+        import time
+        from spectralnp.data.lut import compute_scene_terms
+
+        self._init_ws()
+        self._scenes = []
+
+        t0 = time.time()
+        for i in range(n):
+            # Random scene parameters
+            wv = float(rng.uniform(*wv_range))
+            oz = float(rng.uniform(*oz_range))
+            alt = float(rng.uniform(*alt_range))
+            sza = float(rng.uniform(*sza_range))
+            vza = float(rng.uniform(*vza_range))
+            raa = float(rng.uniform(*raa_range))
+            sensor_alt = float(rng.choice(sensor_alt_choices))
+            aod = float(rng.uniform(*aod_range))
+
+            # Get cached τ for this atmosphere (re-uses ARTS cache).
+            tau_layers, T_layers, z_layers, _ = self._compute_tau_for_random_state(
+                wv, oz, alt
+            )
+
+            # Run path integration up to (but not including) the surface
+            # coupling step. Returns dict of cached intermediates.
+            scene_terms = compute_scene_terms(
+                tau_layers=tau_layers,
+                T_layers=T_layers,
+                z_layers=z_layers,
+                wavelength_nm=self.wavelength_nm,
+                solar_zenith_deg=sza,
+                sensor_zenith_deg=vza,
+                relative_azimuth_deg=raa,
+                sensor_altitude_m=sensor_alt * 1e3,
+                surface_altitude_m=alt * 1e3,
+                aod_550=aod,
+            )
+
+            atmos = AtmosphericState(
+                aod_550=aod,
+                water_vapour=wv,
+                ozone_du=oz,
+                co2_ppmv=self.RANDOM_GAS_DEFAULTS["co2_ppmv"],
+                ch4_ppbv=self.RANDOM_GAS_DEFAULTS["ch4_ppbv"],
+                n2o_ppbv=self.RANDOM_GAS_DEFAULTS["n2o_ppbv"],
+                co_ppbv=self.RANDOM_GAS_DEFAULTS["co_ppbv"],
+                surface_altitude_km=alt,
+            )
+            geometry = ViewGeometry(
+                solar_zenith_deg=sza,
+                sensor_zenith_deg=vza,
+                relative_azimuth_deg=raa,
+                sensor_altitude_km=sensor_alt,
+            )
+
+            self._scenes.append({
+                "atmos": atmos,
+                "geometry": geometry,
+                **scene_terms,
+            })
+
+            if verbose:
+                import sys
+                print(
+                    f"  scene {i+1}/{n}: wv={wv:.2f} oz={oz:.0f} "
+                    f"alt={alt:.1f} sza={sza:.0f} vza={vza:.0f} aod={aod:.2f} "
+                    f"({time.time()-t0:.0f}s elapsed)",
+                    flush=True, file=sys.stderr,
+                )
+        return self._scenes
+
+    def random_scene_index(self, rng: np.random.Generator) -> int:
+        """Return a random index into the cached scenes."""
+        if not self._scenes:
+            raise RuntimeError("No scenes. Call populate_random_scenes() first.")
+        return int(rng.integers(0, len(self._scenes)))
+
+    def simulate_with_scene(
+        self,
+        scene_idx: int,
+        surface_reflectance: np.ndarray,
+        surface_temperature_k: float,
+    ) -> SimulationResult:
+        """Cheap per-sample math: combine a precomputed scene + surface state.
+
+        Roughly 1 ms vs ~14 ms for the full :func:`path_integrate` per sample.
+        """
+        from spectralnp.data.lut import combine_scene_with_surface
+
+        scene = self._scenes[scene_idx]
+
+        # Resample reflectance to ARTS wavelength grid if needed.
+        refl = np.asarray(surface_reflectance, dtype=np.float64)
+        if len(refl) != len(self.wavelength_nm):
+            src_wl = np.linspace(
+                self.wavelength_nm[0], self.wavelength_nm[-1], len(refl)
+            )
+            refl = np.interp(self.wavelength_nm, src_wl, refl)
+
+        toa = combine_scene_with_surface(
+            scene=scene,
+            surface_reflectance=refl,
+            surface_temperature_k=surface_temperature_k,
+            wavelength_nm=self.wavelength_nm,
+        )
+
+        return SimulationResult(
+            wavelength_nm=self.wavelength_nm.copy(),
+            toa_radiance=toa,
+            surface_reflectance=refl,
+            atmospheric_state=scene["atmos"],
+            geometry=scene["geometry"],
+        )
 
     def prepopulate(
         self,
