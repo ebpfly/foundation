@@ -62,12 +62,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="When --abs-lookup is set: number of fresh random "
                          "atmospheres computed at the start of each epoch. "
                          "Each costs ~3 sec of ARTS work.")
-    p.add_argument("--n-scenes-per-epoch", type=int, default=10,
+    p.add_argument("--n-scenes-per-epoch", type=int, default=50,
                     help="When --abs-lookup is set: number of fresh "
                          "(atmosphere, geometry, aerosol) scenes computed "
                          "at the start of each epoch. Each is ~3 sec ARTS + "
                          "a fast path-integration. Per-sample work then "
                          "drops to ~1 ms (just the surface coupling).")
+    # Loss weights (exposed for ablations and debugging KL collapse)
+    p.add_argument("--w-spectral", type=float, default=1.0)
+    p.add_argument("--w-reflectance", type=float, default=1.0)
+    p.add_argument("--w-atmos", type=float, default=0.1)
+    p.add_argument("--w-kl", type=float, default=0.001,
+                    help="KL weight (default 0.001 — was 0.01 which caused "
+                         "collapse on real ARTS data; lower is safer).")
+    p.add_argument("--w-material", type=float, default=0.1)
     p.add_argument("--wl-min-nm", type=float, default=None,
                     help="Min wavelength of the dense reconstruction grid (nm). "
                          "Default: 380 nm (or 300 nm if --abs-lookup is set).")
@@ -244,7 +252,7 @@ def main() -> None:
         d_model=args.d_model,
         n_layers=args.n_layers,
         z_dim=args.z_dim,
-        n_material_classes=len(speclib),
+        n_material_classes=dataset.n_material_classes,
     )
     model = SpectralNP(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -257,7 +265,17 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
 
     # Loss.
-    loss_fn = SpectralNPLoss()
+    loss_fn = SpectralNPLoss(
+        w_spectral=args.w_spectral,
+        w_reflectance=args.w_reflectance,
+        w_atmos=args.w_atmos,
+        w_kl=args.w_kl,
+        w_material=args.w_material,
+    )
+    logger.info(
+        f"Loss weights: spectral={args.w_spectral} reflectance={args.w_reflectance} "
+        f"atmos={args.w_atmos} kl={args.w_kl} material={args.w_material}"
+    )
 
     # Optional W&B.
     if args.wandb:
@@ -320,6 +338,7 @@ def main() -> None:
                 "config": cfg,
                 "loss": best_loss,
                 "speclib_size": len(speclib),
+                "category_names": dataset.category_names,
             }, out_dir / "best.pt")
 
         if (epoch + 1) % 10 == 0:
@@ -329,6 +348,7 @@ def main() -> None:
                 "optimiser_state_dict": optimiser.state_dict(),
                 "config": cfg,
                 "speclib_size": len(speclib),
+                "category_names": dataset.category_names,
             }, out_dir / f"epoch_{epoch+1}.pt")
 
     logger.info(f"Training complete. Best loss: {best_loss:.4f}")

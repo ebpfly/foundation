@@ -21,7 +21,7 @@ def _ground_truth_radiance(
     spec, atmos, geom, wl_dense
 ) -> np.ndarray:
     """Ground-truth dense at-sensor radiance for one (spec, atmos) pair."""
-    refl = np.clip(np.nan_to_num(spec.resample(wl_dense)), 0, 1)
+    refl = np.clip(np.nan_to_num(spec.resample(wl_dense), nan=0.04), 0, 1)
     rtm = simplified_toa_radiance(
         surface_reflectance=refl, wavelength_nm=wl_dense, atmos=atmos, geometry=geom
     )

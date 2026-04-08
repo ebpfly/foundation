@@ -47,12 +47,23 @@ def np_kl_divergence(
     z_log_sigma: Tensor,
     prior_mu: Tensor | None = None,
     prior_log_sigma: Tensor | None = None,
+    log_sigma_min: float = -5.0,
+    log_sigma_max: float = 2.0,
+    free_bits: float = 0.05,
 ) -> Tensor:
     """KL divergence between the context posterior and a prior.
 
     For self-supervised pretraining, the prior is the posterior conditioned
-    on ALL bands (the "target" posterior).  During inference, we use a
+    on ALL bands (the "target" posterior). During inference, we use a
     standard normal prior.
+
+    Stability:
+      - log_sigma is clamped to ``[log_sigma_min, log_sigma_max]`` to
+        prevent the KL from blowing up when the prior is overconfident
+        (small sigma_p) or the context posterior collapses
+      - "free bits": per-dimension KL is floored at ``free_bits``, which
+        prevents the latent from collapsing into the prior (deactivates
+        the dimension)
 
     KL(q(z|context) || p(z)) where both are diagonal Gaussians.
     """
@@ -61,15 +72,22 @@ def np_kl_divergence(
         prior_mu = torch.zeros_like(z_mu)
         prior_log_sigma = torch.zeros_like(z_log_sigma)
 
-    sigma_q = z_log_sigma.exp()
-    sigma_p = prior_log_sigma.exp()
+    # Clamp for stability — prevents the formula from exploding when
+    # sigma_p is very small (overconfident prior) or sigma_q is huge.
+    z_log_sigma = z_log_sigma.clamp(log_sigma_min, log_sigma_max)
+    prior_log_sigma = prior_log_sigma.clamp(log_sigma_min, log_sigma_max)
 
-    kl = (
+    sigma_q_sq = (2 * z_log_sigma).exp()
+    sigma_p_sq = (2 * prior_log_sigma).exp()
+
+    kl_per_dim = (
         prior_log_sigma - z_log_sigma
-        + (sigma_q**2 + (z_mu - prior_mu) ** 2) / (2 * sigma_p**2)
+        + (sigma_q_sq + (z_mu - prior_mu) ** 2) / (2 * sigma_p_sq)
         - 0.5
     )
-    return kl.sum(dim=-1).mean()
+    # Free bits: floor each dimension's KL at `free_bits`, then sum.
+    kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
+    return kl_per_dim.sum(dim=-1).mean()
 
 
 def atmospheric_loss(

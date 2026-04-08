@@ -90,6 +90,17 @@ class SpectralNPDataset(Dataset):
         if self.n_spectra == 0:
             raise ValueError("Spectral library is empty")
 
+        # Build category-id-by-spectrum-index lookup. The model classifies
+        # by USGS *category* (minerals, vegetation, ...) rather than by
+        # individual spectrum (which would just be memorisation).
+        category_by_idx = [s.category for s in spectral_library.spectra]
+        self.category_names = sorted(set(category_by_idx))
+        name_to_id = {n: i for i, n in enumerate(self.category_names)}
+        self.category_id_by_spec = np.array(
+            [name_to_id[c] for c in category_by_idx], dtype=np.int64
+        )
+        self.n_material_classes = len(self.category_names)
+
         # Load LUT if provided.
         self.lut = None
         if lut_path is not None:
@@ -105,17 +116,23 @@ class SpectralNPDataset(Dataset):
         self.use_full_rtm = use_full_rtm
         self.rng = np.random.default_rng(seed)
 
+        # USGS reflectance is mostly VNIR/SWIR (380-2500 nm). For wavelengths
+        # outside the measured range we fill with a graybody value (~0.04)
+        # which corresponds to emissivity ~0.96 — typical for natural
+        # surfaces in MWIR/LWIR. Filling with 0 (the old default) implied
+        # ε=1 (perfect blackbody), which is physically wrong.
+        GRAYBODY_FILL = 0.04
+
         # Pre-resample all spectra to the dense grid.
         self.reflectance_matrix = spectral_library.to_array(self.dense_wl)  # (N, W)
-        # Replace NaN with 0 (out-of-range wavelengths).
-        self.reflectance_matrix = np.nan_to_num(self.reflectance_matrix, nan=0.0)
+        self.reflectance_matrix = np.nan_to_num(self.reflectance_matrix, nan=GRAYBODY_FILL)
         # Clip to physical range.
         self.reflectance_matrix = np.clip(self.reflectance_matrix, 0.0, 1.0).astype(np.float32)
 
         # If LUT is used, also pre-resample spectra onto LUT wavelength grid.
         if self.lut is not None:
             self._lut_reflectance = spectral_library.to_array(self.lut.wavelength_nm)
-            self._lut_reflectance = np.nan_to_num(self._lut_reflectance, nan=0.0)
+            self._lut_reflectance = np.nan_to_num(self._lut_reflectance, nan=GRAYBODY_FILL)
             self._lut_reflectance = np.clip(self._lut_reflectance, 0.0, 1.0).astype(np.float32)
 
         # ARTS abs_lookup-based simulator (with per-atmosphere caching).
@@ -124,7 +141,7 @@ class SpectralNPDataset(Dataset):
             # Trigger workspace init so wavelength_nm is populated.
             self._arts_sim._init_ws()
             self._arts_reflectance = spectral_library.to_array(self._arts_sim.wavelength_nm)
-            self._arts_reflectance = np.nan_to_num(self._arts_reflectance, nan=0.0)
+            self._arts_reflectance = np.nan_to_num(self._arts_reflectance, nan=GRAYBODY_FILL)
             self._arts_reflectance = np.clip(self._arts_reflectance, 0.0, 1.0).astype(np.float32)
 
     def __len__(self) -> int:
@@ -284,7 +301,7 @@ class SpectralNPDataset(Dataset):
             "target_radiance": torch.from_numpy(dense_radiance),
             "target_reflectance": torch.from_numpy(reflectance),
             "atmos_params": torch.from_numpy(atmos_params),
-            "material_idx": spec_idx,
+            "material_idx": int(self.category_id_by_spec[spec_idx]),
         }
 
 
