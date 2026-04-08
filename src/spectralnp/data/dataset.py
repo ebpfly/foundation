@@ -131,7 +131,31 @@ class SpectralNPDataset(Dataset):
         return self.samples_per_epoch
 
     def _sample_atmospheric_state(self) -> AtmosphericState:
-        """Sample a random atmospheric state from physically plausible ranges."""
+        """Sample a random atmospheric state from physically plausible ranges.
+
+        Modes (mutually exclusive):
+        - **scene-based**: if the simulator has pre-cached scenes, return the
+          AtmosphericState from a randomly chosen scene. The dataset's sample
+          handling reads :attr:`_arts_sim._scenes` directly via
+          :meth:`_arts_sim.random_scene_index`.
+        - **per-atm**: if the simulator has pre-cached τ tables (no scenes),
+          draw (wv, oz, alt) from the cached tuples + continuous geometry.
+        - **continuous**: fully random, uses simplified RTM.
+        """
+        if self._arts_sim is not None and self._arts_sim._available_states:
+            wv, oz, alt = self._arts_sim.random_atmospheric_values(self.rng)
+            return AtmosphericState(
+                aod_550=self.rng.uniform(0.01, 1.0),
+                water_vapour=wv,
+                ozone_du=oz,
+                co2_ppmv=self._arts_sim.RANDOM_GAS_DEFAULTS["co2_ppmv"],
+                ch4_ppbv=self._arts_sim.RANDOM_GAS_DEFAULTS["ch4_ppbv"],
+                n2o_ppbv=self._arts_sim.RANDOM_GAS_DEFAULTS["n2o_ppbv"],
+                co_ppbv=self._arts_sim.RANDOM_GAS_DEFAULTS["co_ppbv"],
+                visibility_km=self.rng.uniform(5, 100),
+                surface_altitude_km=alt,
+                surface_temperature_k=self.rng.uniform(260, 330),
+            )
         return AtmosphericState(
             aod_550=self.rng.uniform(0.01, 1.0),
             water_vapour=self.rng.uniform(0.2, 5.0),
@@ -159,52 +183,80 @@ class SpectralNPDataset(Dataset):
         spec_idx = self.rng.integers(0, self.n_spectra)
         reflectance = self.reflectance_matrix[spec_idx]  # (W,)
 
-        # 2. Sample atmospheric state and geometry.
-        atmos = self._sample_atmospheric_state()
-        geometry = self._sample_geometry()
-
-        # 3. Simulate at-sensor radiance.
-        if self._arts_sim is not None:
-            # ARTS abs_lookup path with per-atmosphere caching.
+        # 2. Simulate at-sensor radiance.
+        if self._arts_sim is not None and self._arts_sim._scenes:
+            # ---- Scene-based fast path ----
+            # Atmosphere + geometry + aerosol all come from a precomputed scene.
+            # Per-sample work is just T_s + reflectance + the surface coupling.
+            scene_idx = self._arts_sim.random_scene_index(self.rng)
+            scene = self._arts_sim._scenes[scene_idx]
+            T_s = float(self.rng.uniform(260.0, 330.0))
             arts_refl = self._arts_reflectance[spec_idx].astype(np.float64)
-            result = self._arts_sim.simulate(
+            result = self._arts_sim.simulate_with_scene(
+                scene_idx=scene_idx,
                 surface_reflectance=arts_refl,
-                atmos=atmos,
-                geometry=geometry,
+                surface_temperature_k=T_s,
+            )
+            scene_atmos = scene["atmos"]
+            geometry = scene["geometry"]
+            atmos = AtmosphericState(
+                aod_550=scene_atmos.aod_550,
+                water_vapour=scene_atmos.water_vapour,
+                ozone_du=scene_atmos.ozone_du,
+                co2_ppmv=scene_atmos.co2_ppmv,
+                ch4_ppbv=scene_atmos.ch4_ppbv,
+                n2o_ppbv=scene_atmos.n2o_ppbv,
+                co_ppbv=scene_atmos.co_ppbv,
+                visibility_km=23.0,  # not used in scene-based RT
+                surface_altitude_km=scene_atmos.surface_altitude_km,
+                surface_temperature_k=T_s,
             )
             dense_radiance = np.interp(
                 self.dense_wl, self._arts_sim.wavelength_nm, result.toa_radiance
             ).astype(np.float32)
-        elif self.lut is not None:
-            # LUT-based RT: compute on LUT grid, resample to dense grid.
-            lut_refl = self._lut_reflectance[spec_idx].astype(np.float64)
-            lut_radiance = self.lut.toa_radiance(
-                lut_refl,
-                water_vapour=atmos.water_vapour,
-                ozone_du=atmos.ozone_du,
-                co2_ppmv=atmos.co2_ppmv,
-                ch4_ppbv=atmos.ch4_ppbv,
-                n2o_ppbv=atmos.n2o_ppbv,
-                co_ppbv=atmos.co_ppbv,
-                surface_altitude_km=atmos.surface_altitude_km,
-                solar_zenith_deg=geometry.solar_zenith_deg,
-                sensor_zenith_deg=geometry.sensor_zenith_deg,
-                relative_azimuth_deg=geometry.relative_azimuth_deg,
-                sensor_altitude_km=geometry.sensor_altitude_km,
-                surface_temperature_k=atmos.surface_temperature_k or 300.0,
-                aod_550=atmos.aod_550,
-            )
-            dense_radiance = np.interp(
-                self.dense_wl, self.lut.wavelength_nm, lut_radiance
-            ).astype(np.float32)
         else:
-            result = simplified_toa_radiance(
-                surface_reflectance=reflectance,
-                wavelength_nm=self.dense_wl,
-                atmos=atmos,
-                geometry=geometry,
-            )
-            dense_radiance = result.toa_radiance.astype(np.float32)
+            # ---- Slower paths (full per-sample RT) ----
+            atmos = self._sample_atmospheric_state()
+            geometry = self._sample_geometry()
+            if self._arts_sim is not None:
+                arts_refl = self._arts_reflectance[spec_idx].astype(np.float64)
+                result = self._arts_sim.simulate(
+                    surface_reflectance=arts_refl,
+                    atmos=atmos,
+                    geometry=geometry,
+                )
+                dense_radiance = np.interp(
+                    self.dense_wl, self._arts_sim.wavelength_nm, result.toa_radiance
+                ).astype(np.float32)
+            elif self.lut is not None:
+                lut_refl = self._lut_reflectance[spec_idx].astype(np.float64)
+                lut_radiance = self.lut.toa_radiance(
+                    lut_refl,
+                    water_vapour=atmos.water_vapour,
+                    ozone_du=atmos.ozone_du,
+                    co2_ppmv=atmos.co2_ppmv,
+                    ch4_ppbv=atmos.ch4_ppbv,
+                    n2o_ppbv=atmos.n2o_ppbv,
+                    co_ppbv=atmos.co_ppbv,
+                    surface_altitude_km=atmos.surface_altitude_km,
+                    solar_zenith_deg=geometry.solar_zenith_deg,
+                    sensor_zenith_deg=geometry.sensor_zenith_deg,
+                    relative_azimuth_deg=geometry.relative_azimuth_deg,
+                    sensor_altitude_km=geometry.sensor_altitude_km,
+                    surface_temperature_k=atmos.surface_temperature_k or 300.0,
+                    aod_550=atmos.aod_550,
+                )
+                dense_radiance = np.interp(
+                    self.dense_wl, self.lut.wavelength_nm, lut_radiance
+                ).astype(np.float32)
+            else:
+                result = simplified_toa_radiance(
+                    surface_reflectance=reflectance,
+                    wavelength_nm=self.dense_wl,
+                    atmos=atmos,
+                    geometry=geometry,
+                )
+                dense_radiance = result.toa_radiance.astype(np.float32)
 
         # 4. Generate random virtual sensor.
         sensor = sample_virtual_sensor(

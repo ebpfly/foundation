@@ -857,3 +857,363 @@ def path_integrate(
     L_total = L_up_atm + L_surface + L_path_ray + L_path_aer
 
     return np.maximum(L_total, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Scene-based RT — precompute everything that doesn't depend on surface
+# ---------------------------------------------------------------------------
+
+
+def compute_scene_terms(
+    tau_layers: np.ndarray,
+    T_layers: np.ndarray,
+    z_layers: np.ndarray,
+    wavelength_nm: np.ndarray,
+    solar_zenith_deg: float = 30.0,
+    sensor_zenith_deg: float = 0.0,
+    relative_azimuth_deg: float = 0.0,
+    sensor_altitude_m: float = 800e3,
+    surface_altitude_m: float = 0.0,
+    aod_550: float = 0.0,
+) -> dict[str, np.ndarray]:
+    """Precompute all RT pieces that depend only on (atmosphere, geometry, aod).
+
+    Returns a dict of (n_λ,) arrays:
+        ``L_atm_total``  upwelling atm thermal + Rayleigh + aerosol path radiance
+        ``E_ground``     direct + diffuse solar + downwelling atm thermal at ground
+        ``T_up_total``   total transmittance from surface to sensor
+        ``S_atm``        atmospheric spherical albedo (for multiple-reflection coupling)
+
+    Combined later with surface (rho, T_s) via :func:`combine_scene_with_surface`.
+    """
+    wl = np.asarray(wavelength_nm, dtype=np.float64)
+    n_wl = len(wl)
+
+    cos_sza = np.cos(np.radians(solar_zenith_deg))
+    cos_vza = max(np.cos(np.radians(sensor_zenith_deg)), 0.05)
+    mu_sun = max(cos_sza, 0.05)
+    mu_sen = cos_vza
+
+    # ---- Layer selection (column path: surface → sensor) ----
+    mask = (z_layers >= surface_altitude_m) & (z_layers <= sensor_altitude_m)
+    tau_col = tau_layers[mask]
+    T_col = T_layers[mask]
+    z_col = z_layers[mask]
+
+    # Full column for solar/downwelling pathways.
+    mask_full = z_layers >= surface_altitude_m
+    tau_full = tau_layers[mask_full]
+
+    if len(tau_col) == 0:
+        # Sensor below the lowest layer — degenerate scene.
+        return {
+            "L_atm_total": np.zeros(n_wl, dtype=np.float64),
+            "E_ground": np.zeros(n_wl, dtype=np.float64),
+            "T_up_total": np.ones(n_wl, dtype=np.float64),
+            "S_atm": np.zeros(n_wl, dtype=np.float64),
+        }
+
+    # ---- Aerosol distribution ----
+    wl_um = wl * 1e-3
+    if aod_550 > 0:
+        tau_aer_total = aod_550 * (0.55 / wl_um) ** 1.3
+        aer_w = np.exp(-(z_col - surface_altitude_m) / 2000.0)
+        aer_w /= aer_w.sum() + 1e-30
+        tau_aer_layers = aer_w[:, np.newaxis] * tau_aer_total[np.newaxis, :]
+        z_full = z_layers[mask_full]
+        aer_w_full = np.exp(-(z_full - surface_altitude_m) / 2000.0)
+        aer_w_full /= aer_w_full.sum() + 1e-30
+        tau_aer_full = aer_w_full[:, np.newaxis] * tau_aer_total[np.newaxis, :]
+    else:
+        tau_aer_total = np.zeros(n_wl)
+        tau_aer_layers = np.zeros_like(tau_col)
+        tau_aer_full = np.zeros_like(tau_full)
+
+    tau_col_total = tau_col + tau_aer_layers
+    tau_full_total = tau_full + tau_aer_full
+
+    # ---- Upwelling thermal emission (Schwarzschild) ----
+    tau_slant_up = tau_col_total / mu_sen
+    tau_cum_up = np.cumsum(tau_slant_up, axis=0)
+    T_up_total = np.exp(-tau_cum_up[-1])  # (n_λ,)
+
+    B_layers = planck_array(wl, T_col)
+    layer_emiss = 1.0 - np.exp(-tau_slant_up)
+    tau_above_layer = tau_cum_up[-1][np.newaxis, :] - tau_cum_up
+    T_above_layer = np.exp(-tau_above_layer)
+    L_up_atm = np.sum(B_layers * layer_emiss * T_above_layer, axis=0)
+
+    # ---- Downwelling thermal emission ----
+    tau_slant_down_full = tau_full_total / 1.66
+    B_full = planck_array(wl, T_layers[mask_full])
+    n_full = len(tau_slant_down_full)
+    idx_top = np.arange(n_full - 1, -1, -1)
+    tau_down_topdown = tau_slant_down_full[idx_top]
+    B_topdown = B_full[idx_top]
+    tau_cum_topdown = np.cumsum(tau_down_topdown, axis=0)
+    layer_emiss_down = 1.0 - np.exp(-tau_down_topdown)
+    T_below = np.exp(-(tau_cum_topdown[-1][np.newaxis, :] - tau_cum_topdown))
+    L_down_atm = np.sum(B_topdown * layer_emiss_down * T_below, axis=0)
+
+    # ---- Solar irradiance at ground ----
+    tau_slant_sun = tau_full_total / mu_sun
+    T_sun_total = np.exp(-np.sum(tau_slant_sun, axis=0))
+    E_sun_toa = planck(wl, 5778.0) * _SOLAR_OMEGA
+    E_direct_ground = E_sun_toa * cos_sza * T_sun_total
+
+    # ---- Rayleigh path radiance ----
+    tau_ray = 0.00864 * (wl_um ** (-3.916 - 0.074 * wl_um + 0.05 / wl_um))
+    P_ray = 0.75 * (1.0 + cos_vza ** 2)
+    L_path_ray = (
+        E_sun_toa * cos_sza / (4.0 * np.pi)
+        * tau_ray * P_ray
+        / (mu_sun + mu_sen)
+        * (1.0 - np.exp(-tau_ray * (1.0 / mu_sun + 1.0 / mu_sen)))
+    )
+
+    # ---- Aerosol path radiance ----
+    if aod_550 > 0:
+        sin_s = np.sin(np.radians(solar_zenith_deg))
+        sin_v = np.sin(np.radians(sensor_zenith_deg))
+        cos_scat = -(cos_sza * cos_vza
+                     + sin_s * sin_v * np.cos(np.radians(relative_azimuth_deg)))
+        g = 0.65
+        P_HG = (1 - g**2) / np.maximum((1 + g**2 - 2 * g * cos_scat) ** 1.5, 1e-10)
+        omega_aer = 0.92
+        L_path_aer = (
+            E_sun_toa * cos_sza * omega_aer * tau_aer_total * P_HG
+            / (4.0 * np.pi * (mu_sun + mu_sen))
+        )
+    else:
+        L_path_aer = np.zeros(n_wl)
+
+    # ---- Spherical albedo ----
+    S_ray = 0.05 * tau_ray
+    S_aer = (0.92 * (1 - 0.65) * aod_550 * (0.55 / wl_um) ** 1.3 * 0.5
+             if aod_550 > 0 else 0.0)
+    S_atm = np.clip(S_ray + S_aer, 0, 0.999)
+
+    # ---- Diffuse solar at ground (rough Rayleigh-scattered fraction) ----
+    E_diffuse_ground = E_sun_toa * cos_sza * (1.0 - np.exp(-tau_ray / mu_sun)) * 0.5
+
+    # ---- Total irradiance reaching the surface (direct + diffuse + downwelling thermal) ----
+    E_ground = E_direct_ground + E_diffuse_ground + np.pi * L_down_atm
+
+    # ---- L_atm_total = everything that just gets added at the end ----
+    L_atm_total = L_up_atm + L_path_ray + L_path_aer
+
+    return {
+        "L_atm_total": L_atm_total,
+        "E_ground": E_ground,
+        "T_up_total": T_up_total,
+        "S_atm": S_atm,
+    }
+
+
+def combine_scene_with_surface(
+    scene: dict[str, np.ndarray],
+    surface_reflectance: np.ndarray,
+    surface_temperature_k: float,
+    wavelength_nm: np.ndarray,
+) -> np.ndarray:
+    """Cheap per-sample math: combine a precomputed scene with a surface state.
+
+    Returns at-sensor radiance ``(n_λ,)`` in W m⁻² sr⁻¹ μm⁻¹.
+    """
+    rho = np.asarray(surface_reflectance, dtype=np.float64)
+    wl = np.asarray(wavelength_nm, dtype=np.float64)
+
+    B_surface = planck(wl, surface_temperature_k)
+    eps = 1.0 - rho
+
+    L_surface_up = (
+        rho * scene["E_ground"] / np.pi + eps * B_surface
+    ) * scene["T_up_total"]
+    L_surface = L_surface_up / np.maximum(1.0 - rho * scene["S_atm"], 1e-6)
+    L_total = scene["L_atm_total"] + L_surface
+    return np.maximum(L_total, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Legacy batched path integration (unused — kept temporarily)
+# ---------------------------------------------------------------------------
+
+
+def path_integrate_batch(
+    tau_layers: np.ndarray,           # (B, L, F)
+    T_layers: np.ndarray,             # (B, L)
+    z_layers: np.ndarray,             # (B, L)
+    wavelength_nm: np.ndarray,        # (F,) — shared across batch
+    surface_reflectance: np.ndarray,  # (B, F)
+    solar_zenith_deg: np.ndarray,     # (B,)
+    sensor_zenith_deg: np.ndarray,    # (B,)
+    relative_azimuth_deg: np.ndarray, # (B,)
+    sensor_altitude_m: np.ndarray,    # (B,)
+    surface_altitude_m: np.ndarray,   # (B,)
+    surface_temperature_k: np.ndarray, # (B,)
+    aod_550: np.ndarray,              # (B,)
+) -> np.ndarray:
+    """Batched version of ``path_integrate`` over a batch of samples.
+
+    All inputs have a leading batch dim ``B`` (except ``wavelength_nm``).
+    Returns ``(B, F)`` at-sensor radiance.
+
+    Layer-selection masks are implemented as multiplications by a 0/1 mask
+    rather than fancy indexing, so all samples are processed in parallel
+    on the same tensor shapes.
+    """
+    dtype = np.float32  # halves memory bandwidth vs float64
+    tau_layers = np.asarray(tau_layers, dtype=dtype)             # (B, L, F)
+    T_layers   = np.asarray(T_layers, dtype=dtype)               # (B, L)
+    z_layers   = np.asarray(z_layers, dtype=dtype)               # (B, L)
+    wl = np.asarray(wavelength_nm, dtype=dtype)                  # (F,)
+    rho = np.asarray(surface_reflectance, dtype=dtype)           # (B, F)
+
+    sza = np.asarray(solar_zenith_deg, dtype=dtype)              # (B,)
+    vza = np.asarray(sensor_zenith_deg, dtype=dtype)             # (B,)
+    raa = np.asarray(relative_azimuth_deg, dtype=dtype)          # (B,)
+    sensor_alt = np.asarray(sensor_altitude_m, dtype=dtype)      # (B,)
+    surface_alt = np.asarray(surface_altitude_m, dtype=dtype)    # (B,)
+    T_s = np.asarray(surface_temperature_k, dtype=dtype)         # (B,)
+    aod = np.asarray(aod_550, dtype=dtype)                       # (B,)
+
+    B, L, F = tau_layers.shape
+
+    cos_sza = np.cos(np.radians(sza))                  # (B,)
+    cos_vza = np.maximum(np.cos(np.radians(vza)), 0.05)  # (B,)
+    mu_sun = np.maximum(cos_sza, 0.05)                 # (B,)
+    mu_sen = cos_vza                                    # (B,)
+
+    # ---- Layer mask: bottom = surface, top = sensor ----
+    # column path (surface → sensor)
+    mask_col = (
+        (z_layers >= surface_alt[:, None]) &
+        (z_layers <= sensor_alt[:, None])
+    ).astype(np.float64)                                # (B, L)
+    # full column (TOA → surface) for solar/down-welling paths
+    mask_full = (z_layers >= surface_alt[:, None]).astype(np.float64)  # (B, L)
+
+    # ---- Aerosol optical depth per layer ----
+    wl_um = wl * 1e-3                                   # (F,)
+    tau_aer_total = aod[:, None] * (0.55 / wl_um[None, :]) ** 1.3   # (B, F)
+
+    # Distribute aerosol exponentially with altitude (relative to surface).
+    # Weight by mask so layers above sensor or below surface contribute zero.
+    z_rel = z_layers - surface_alt[:, None]             # (B, L)
+    aer_w_col = np.exp(-z_rel / 2000.0) * mask_col       # (B, L)
+    aer_w_col_sum = aer_w_col.sum(axis=1, keepdims=True) + 1e-30
+    aer_w_col = aer_w_col / aer_w_col_sum                # (B, L)
+    tau_aer_layers_col = aer_w_col[:, :, None] * tau_aer_total[:, None, :]  # (B, L, F)
+
+    aer_w_full = np.exp(-z_rel / 2000.0) * mask_full      # (B, L)
+    aer_w_full_sum = aer_w_full.sum(axis=1, keepdims=True) + 1e-30
+    aer_w_full = aer_w_full / aer_w_full_sum
+    tau_aer_layers_full = aer_w_full[:, :, None] * tau_aer_total[:, None, :]
+
+    # ---- Total optical depth (gas+aerosol), with masks applied ----
+    tau_col_total = (tau_layers + tau_aer_layers_col) * mask_col[:, :, None]
+    tau_full_total = (tau_layers + tau_aer_layers_full) * mask_full[:, :, None]
+
+    # ---- Upward transmittance (surface → sensor) ----
+    tau_slant_up = tau_col_total / mu_sen[:, None, None]            # (B, L, F)
+    tau_cum_up = np.cumsum(tau_slant_up, axis=1)                    # (B, L, F)
+    tau_total_up = tau_cum_up[:, -1, :]                             # (B, F)
+    T_up_total = np.exp(-tau_total_up)                              # (B, F)
+
+    # ---- Upwelling thermal emission ----
+    B_layers = planck_array_batch(wl, T_layers)                     # (B, L, F)
+    layer_emiss_up = 1.0 - np.exp(-tau_slant_up)                    # (B, L, F)
+    tau_above_layer = tau_total_up[:, None, :] - tau_cum_up         # (B, L, F)
+    T_above_layer = np.exp(-tau_above_layer)                        # (B, L, F)
+    L_up_atm = np.sum(B_layers * layer_emiss_up * T_above_layer * mask_col[:, :, None],
+                      axis=1)                                       # (B, F)
+
+    # ---- Downwelling thermal emission (TOA → surface) using diffusivity 1.66 ----
+    tau_slant_down = tau_full_total / 1.66                          # (B, L, F)
+    # Reverse along layer axis to integrate top-down.
+    tau_down_topdown = tau_slant_down[:, ::-1, :]                   # (B, L, F)
+    B_down_topdown = B_layers[:, ::-1, :]
+    mask_full_topdown = mask_full[:, ::-1]
+    tau_cum_topdown = np.cumsum(tau_down_topdown, axis=1)
+    tau_total_down = tau_cum_topdown[:, -1, :]                       # (B, F)
+    layer_emiss_down = 1.0 - np.exp(-tau_down_topdown)
+    T_below = np.exp(-(tau_total_down[:, None, :] - tau_cum_topdown))
+    L_down_atm = np.sum(B_down_topdown * layer_emiss_down * T_below * mask_full_topdown[:, :, None],
+                        axis=1)                                      # (B, F)
+
+    # ---- Solar irradiance at ground ----
+    tau_slant_sun = tau_full_total / mu_sun[:, None, None]
+    T_sun_total = np.exp(-np.sum(tau_slant_sun, axis=1))             # (B, F)
+    E_sun_toa = planck(wl, 5778.0) * _SOLAR_OMEGA                    # (F,)
+    E_direct_ground = E_sun_toa[None, :] * cos_sza[:, None] * T_sun_total  # (B, F)
+
+    # ---- Rayleigh path radiance (analytical, single-scatter) ----
+    tau_ray = 0.00864 * (wl_um ** (-3.916 - 0.074 * wl_um + 0.05 / wl_um))  # (F,)
+    P_ray = 0.75 * (1.0 + cos_vza ** 2)                              # (B,)
+    L_path_ray = (
+        E_sun_toa[None, :] * cos_sza[:, None] / (4.0 * np.pi)
+        * tau_ray[None, :] * P_ray[:, None]
+        / (mu_sun[:, None] + mu_sen[:, None])
+        * (1.0 - np.exp(-tau_ray[None, :] * (1.0 / mu_sun[:, None] + 1.0 / mu_sen[:, None])))
+    )                                                                 # (B, F)
+
+    # ---- Aerosol path radiance ----
+    sin_s = np.sin(np.radians(sza))
+    sin_v = np.sin(np.radians(vza))
+    cos_scat = -(cos_sza * cos_vza + sin_s * sin_v * np.cos(np.radians(raa)))
+    g = 0.65
+    P_HG = (1 - g**2) / np.maximum((1 + g**2 - 2 * g * cos_scat) ** 1.5, 1e-10)  # (B,)
+    omega_aer = 0.92
+    L_path_aer = (
+        E_sun_toa[None, :] * cos_sza[:, None] * omega_aer * tau_aer_total * P_HG[:, None]
+        / (4.0 * np.pi * (mu_sun[:, None] + mu_sen[:, None]))
+    )                                                                 # (B, F)
+    # Zero out where aod = 0
+    L_path_aer = L_path_aer * (aod[:, None] > 0).astype(np.float64)
+
+    # ---- Spherical albedo ----
+    S_ray = 0.05 * tau_ray[None, :]                                   # (1, F)
+    S_aer = 0.92 * (1 - 0.65) * tau_aer_total * 0.5                   # (B, F)
+    S_atm = np.clip(S_ray + S_aer, 0, 0.999)                          # (B, F)
+
+    # ---- Surface terms ----
+    eps = 1.0 - rho                                                   # (B, F)
+    B_surface = planck_array_batch(wl, T_s[:, None]).reshape(B, F)    # (B, F)
+
+    E_diffuse_ground = (
+        E_sun_toa[None, :] * cos_sza[:, None]
+        * (1.0 - np.exp(-tau_ray[None, :] / mu_sun[:, None])) * 0.5
+    )                                                                 # (B, F)
+    E_ground_total = E_direct_ground + E_diffuse_ground + np.pi * L_down_atm
+
+    # Upwelling from surface (before multiple reflections):
+    L_surface_up = (rho * E_ground_total / np.pi + eps * B_surface) * T_up_total
+    # Multiple reflection correction.
+    L_surface = L_surface_up / np.maximum(1.0 - rho * S_atm, 1e-6)
+
+    # ---- Total at sensor ----
+    L_total = L_up_atm + L_surface + L_path_ray + L_path_aer
+    return np.maximum(L_total, 0.0)
+
+
+def planck_array_batch(wavelength_nm: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """Planck radiance over an array of temperatures and wavelengths.
+
+    Parameters
+    ----------
+    wavelength_nm : (F,)
+    T : array of arbitrary shape ``(*S,)`` of temperatures (K)
+
+    Returns
+    -------
+    Array of shape ``(*S, F)`` of B(λ, T) in W m⁻² sr⁻¹ μm⁻¹.
+    """
+    lam = np.asarray(wavelength_nm, dtype=np.float64) * 1e-9          # (F,)
+    T = np.asarray(T, dtype=np.float64)
+    # Insert wavelength axis at the end.
+    x = np.minimum(_H * _C / (lam * _K * T[..., None]), 500.0)
+    return (
+        (2.0 * _H * _C**2 / lam**5)
+        / (np.exp(x) - 1.0)
+        * 1e-6
+    )
