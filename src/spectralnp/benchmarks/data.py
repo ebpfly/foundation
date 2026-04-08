@@ -15,7 +15,7 @@ from spectralnp.data.random_sensor import VirtualSensor, sample_virtual_sensor
 from spectralnp.data.rtm_simulator import AtmosphericState, ViewGeometry
 from spectralnp.data.sensor_definitions import (
     AVIRIS_NG,
-    EnMAP,
+    ENMAP,
     LANDSAT8_OLI,
     SENTINEL2_MSI,
 )
@@ -91,7 +91,7 @@ def real_sensors() -> list[SensorScenario]:
     return [
         SensorScenario("Landsat-8", LANDSAT8_OLI, LANDSAT8_OLI.n_bands),
         SensorScenario("Sentinel-2", SENTINEL2_MSI, SENTINEL2_MSI.n_bands),
-        SensorScenario("EnMAP", EnMAP, EnMAP.n_bands),
+        SensorScenario("ENMAP", ENMAP, ENMAP.n_bands),
         SensorScenario("AVIRIS-NG", AVIRIS_NG, AVIRIS_NG.n_bands),
     ]
 

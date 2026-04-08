@@ -36,6 +36,8 @@ def main():
                    help="Output base directory")
     p.add_argument("--n-samples", type=int, default=16,
                    help="Number of latent samples per prediction")
+    p.add_argument("--n-test-spectra", type=int, default=None,
+                   help="Limit test set size (default: full 150)")
     p.add_argument("--snr", type=float, default=200.0,
                    help="Signal-to-noise ratio for sensor noise injection")
     p.add_argument("--device", type=str, default="auto",
@@ -78,6 +80,9 @@ def main():
     log.info(f"Loaded {len(full_speclib)} spectra from USGS")
 
     test_speclib, test_indices = bench_data.held_out_speclib(full_speclib)
+    if args.n_test_spectra is not None and args.n_test_spectra < len(test_speclib):
+        test_speclib.spectra = test_speclib.spectra[: args.n_test_spectra]
+        test_indices = test_indices[: args.n_test_spectra]
     log.info(f"Held-out test set: {len(test_speclib)} spectra (indices seed={bench_data.TEST_SPLIT_SEED})")
 
     # ---- Run benchmarks ----
