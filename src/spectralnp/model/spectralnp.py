@@ -45,9 +45,13 @@ class SpectralNPConfig:
 class SpectralNPOutput:
     """Container for all model outputs from a single forward pass."""
 
-    # Spectral reconstruction
+    # Spectral reconstruction (at-sensor radiance)
     spectral_mu: Tensor | None = None       # (B, Q)
     spectral_log_var: Tensor | None = None  # (B, Q)
+
+    # Surface reflectance reconstruction (atmosphere-corrected)
+    reflectance_mu: Tensor | None = None        # (B, Q)
+    reflectance_log_var: Tensor | None = None   # (B, Q)
 
     # Material classification
     material_logits: Tensor | None = None   # (B, n_classes)
@@ -110,7 +114,17 @@ class SpectralNP(nn.Module):
         )
 
         # Decoders consume z = cat(z_atm, z_surf).
+        # Radiance head — at-sensor TOA radiance.
         self.spectral_decoder = SpectralDecoder(
+            d_model=cfg.d_model,
+            z_dim=z_total,
+            n_frequencies=cfg.n_frequencies,
+            hidden=cfg.spectral_hidden,
+            n_layers=cfg.spectral_n_layers,
+        )
+        # Reflectance head — atmosphere-corrected surface reflectance.
+        # Same architecture as the radiance decoder; learns its own weights.
+        self.reflectance_decoder = SpectralDecoder(
             d_model=cfg.d_model,
             z_dim=z_total,
             n_frequencies=cfg.n_frequencies,
@@ -280,6 +294,9 @@ class SpectralNP(nn.Module):
             out.spectral_mu, out.spectral_log_var = self.spectral_decoder(
                 r, z, query_wavelength, query_fwhm
             )
+            out.reflectance_mu, out.reflectance_log_var = self.reflectance_decoder(
+                r, z, query_wavelength, query_fwhm
+            )
 
         # Material classification (surface + atmosphere).
         out.material_logits = self.material_decoder(r, z)
@@ -319,6 +336,7 @@ class SpectralNP(nn.Module):
         )
 
         spectral_samples = []
+        reflectance_samples = []
         material_logit_samples = []
         atmos_gamma_samples = []
         atmos_epistemic_samples = []
@@ -331,6 +349,8 @@ class SpectralNP(nn.Module):
             if query_wavelength is not None:
                 s_mu, s_logvar = self.spectral_decoder(r, z, query_wavelength, query_fwhm)
                 spectral_samples.append(s_mu)
+                rho_mu, rho_logvar = self.reflectance_decoder(r, z, query_wavelength, query_fwhm)
+                reflectance_samples.append(rho_mu)
 
             material_logit_samples.append(self.material_decoder(r, z))
 
@@ -344,6 +364,10 @@ class SpectralNP(nn.Module):
             stacked = torch.stack(spectral_samples)
             results["spectral_mean"] = stacked.mean(0)
             results["spectral_std"] = stacked.std(0)
+        if reflectance_samples:
+            rho_stack = torch.stack(reflectance_samples)
+            results["reflectance_mean"] = rho_stack.mean(0)
+            results["reflectance_std"] = rho_stack.std(0)
 
         mat_stack = torch.stack(material_logit_samples)
         mat_probs = mat_stack.softmax(dim=-1).mean(0)

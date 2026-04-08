@@ -106,6 +106,7 @@ class SpectralNPLoss(torch.nn.Module):
     def __init__(
         self,
         w_spectral: float = 1.0,
+        w_reflectance: float = 1.0,
         w_atmos: float = 0.1,
         w_kl: float = 0.01,
         w_material: float = 0.1,
@@ -113,6 +114,7 @@ class SpectralNPLoss(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.w_spectral = w_spectral
+        self.w_reflectance = w_reflectance
         self.w_atmos = w_atmos
         self.w_kl = w_kl
         self.w_material = w_material
@@ -123,6 +125,7 @@ class SpectralNPLoss(torch.nn.Module):
         output,  # SpectralNPOutput
         target_radiance: Tensor,        # (B, Q)
         target_atmos: Tensor,           # (B, n_params)
+        target_reflectance: Tensor | None = None,  # (B, Q)
         target_material: Tensor | None = None,  # (B,) long
         prior_mu: Tensor | None = None,
         prior_log_sigma: Tensor | None = None,
@@ -133,10 +136,16 @@ class SpectralNPLoss(torch.nn.Module):
         """
         losses: dict[str, Tensor] = {}
 
-        # Spectral reconstruction.
+        # Spectral reconstruction (radiance).
         if output.spectral_mu is not None:
             losses["spectral"] = spectral_reconstruction_loss(
                 output.spectral_mu, output.spectral_log_var, target_radiance
+            )
+
+        # Surface reflectance reconstruction.
+        if output.reflectance_mu is not None and target_reflectance is not None:
+            losses["reflectance"] = spectral_reconstruction_loss(
+                output.reflectance_mu, output.reflectance_log_var, target_reflectance
             )
 
         # Atmospheric parameters.
@@ -165,6 +174,8 @@ class SpectralNPLoss(torch.nn.Module):
         total = torch.tensor(0.0, device=target_radiance.device)
         if "spectral" in losses:
             total = total + self.w_spectral * losses["spectral"]
+        if "reflectance" in losses:
+            total = total + self.w_reflectance * losses["reflectance"]
         if "atmos" in losses:
             total = total + self.w_atmos * losses["atmos"]
         if "kl" in losses:
