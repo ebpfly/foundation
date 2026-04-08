@@ -81,6 +81,7 @@ class SpectralNPDataset(Dataset):
         samples_per_epoch: int = 100_000,
         n_bands_range: tuple[int, int] = (3, 200),
         lut_path: str | Path | None = None,
+        arts_simulator=None,
         use_full_rtm: bool = False,
         seed: int = 42,
     ) -> None:
@@ -117,7 +118,14 @@ class SpectralNPDataset(Dataset):
             self._lut_reflectance = np.nan_to_num(self._lut_reflectance, nan=0.0)
             self._lut_reflectance = np.clip(self._lut_reflectance, 0.0, 1.0).astype(np.float32)
 
-        self._arts_sim = None
+        # ARTS abs_lookup-based simulator (with per-atmosphere caching).
+        self._arts_sim = arts_simulator
+        if self._arts_sim is not None:
+            # Trigger workspace init so wavelength_nm is populated.
+            self._arts_sim._init_ws()
+            self._arts_reflectance = spectral_library.to_array(self._arts_sim.wavelength_nm)
+            self._arts_reflectance = np.nan_to_num(self._arts_reflectance, nan=0.0)
+            self._arts_reflectance = np.clip(self._arts_reflectance, 0.0, 1.0).astype(np.float32)
 
     def __len__(self) -> int:
         return self.samples_per_epoch
@@ -156,7 +164,18 @@ class SpectralNPDataset(Dataset):
         geometry = self._sample_geometry()
 
         # 3. Simulate at-sensor radiance.
-        if self.lut is not None:
+        if self._arts_sim is not None:
+            # ARTS abs_lookup path with per-atmosphere caching.
+            arts_refl = self._arts_reflectance[spec_idx].astype(np.float64)
+            result = self._arts_sim.simulate(
+                surface_reflectance=arts_refl,
+                atmos=atmos,
+                geometry=geometry,
+            )
+            dense_radiance = np.interp(
+                self.dense_wl, self._arts_sim.wavelength_nm, result.toa_radiance
+            ).astype(np.float32)
+        elif self.lut is not None:
             # LUT-based RT: compute on LUT grid, resample to dense grid.
             lut_refl = self._lut_reflectance[spec_idx].astype(np.float64)
             lut_radiance = self.lut.toa_radiance(

@@ -303,6 +303,280 @@ class ARTSSimulator:
 
 
 # ---------------------------------------------------------------------------
+# ARTS abs_lookup-backed simulator (caches tau per atmosphere)
+# ---------------------------------------------------------------------------
+
+
+class ARTSLookupSimulator:
+    """RTM using ARTS ``abs_lookup`` for gas absorption + cached layer τ.
+
+    Each ``simulate()`` call:
+      1. Quantises the atmospheric state into a coarse cache key.
+      2. If the (atmos_key) is not in cache, calls ARTS once per layer to
+         compute layer-by-layer optical depths via ``propmat_clearskyAddFromLookup``.
+      3. Runs the existing ``path_integrate()`` on the cached τ tensor with
+         the *actual* (un-quantised) geometry, surface, and aerosol params.
+
+    The ARTS workspace is created lazily and is **not fork-safe**, so callers
+    must use ``num_workers=0`` in any DataLoader.
+
+    Parameters
+    ----------
+    abs_lookup_path : str
+        Path to an ARTS ``abs_lookup`` XML file (e.g. produced by ``atmgen``).
+    n_layers : int
+        Number of atmospheric layers.  Default 50.
+    toa_m : float
+        Top-of-atmosphere altitude in metres.  Default 100 km.
+    cache_quantize : dict, optional
+        Per-parameter rounding for the cache key.  Default rounds
+        water_vapour to 1.0, ozone_du to 100, and surface_altitude_km to 1.0.
+    """
+
+    DEFAULT_QUANTIZE = {
+        "water_vapour": 1.0,
+        "ozone_du": 100.0,
+        "co2_ppmv": 200.0,    # effectively fixed
+        "ch4_ppbv": 500.0,    # effectively fixed
+        "n2o_ppbv": 100.0,    # effectively fixed
+        "co_ppbv": 500.0,     # effectively fixed
+        "surface_altitude_km": 1.0,
+    }
+
+    def __init__(
+        self,
+        abs_lookup_path: str,
+        n_layers: int = 50,
+        toa_m: float = 100e3,
+        cache_quantize: dict | None = None,
+    ) -> None:
+        self.abs_lookup_path = abs_lookup_path
+        self.n_layers = n_layers
+        self.toa_m = toa_m
+        self.cache_quantize = cache_quantize or dict(self.DEFAULT_QUANTIZE)
+        self._ws = None
+        self.wavelength_nm: np.ndarray | None = None
+        self._cache: dict[tuple, tuple[np.ndarray, ...]] = {}
+        self._n_misses = 0
+        self._n_hits = 0
+
+    # ------------------------------------------------------------------
+    # Lazy init
+    # ------------------------------------------------------------------
+
+    def _init_ws(self) -> None:
+        """Create the ARTS workspace and load the abs_lookup."""
+        if self._ws is not None:
+            return
+        import pyarts
+
+        pyarts.cat.download.retrieve()
+
+        ws = pyarts.Workspace()
+        ws.atmosphere_dim = 1
+        ws.stokes_dim = 1
+        ws.abs_species = [
+            "H2O, H2O-SelfContCKDMT400, H2O-ForeignContCKDMT400",
+            "CO2", "O3", "N2O", "CH4", "CO", "O2", "N2",
+        ]
+        ws.ReadXML(ws.abs_lookup, str(self.abs_lookup_path))
+        ws.f_gridFromGasAbsLookup()
+        ws.abs_lookupAdapt()
+
+        @pyarts.workspace.arts_agenda
+        def propmat_clearsky_agenda(ws):
+            ws.Ignore(ws.rtp_mag)
+            ws.Ignore(ws.rtp_los)
+            ws.Ignore(ws.rtp_nlte)
+            ws.propmat_clearskyInit()
+            ws.propmat_clearskyAddFromLookup()
+
+        ws.propmat_clearsky_agenda = propmat_clearsky_agenda
+        ws.jacobian_quantities = pyarts.arts.ArrayOfRetrievalQuantity()
+        ws.propmat_clearsky_agenda_checkedCalc()
+
+        self._ws = ws
+        f_grid = np.array(ws.f_grid.value)
+        self.wavelength_nm = (_C / f_grid * 1e9).astype(np.float64)
+        # ARTS f_grid is descending, so wl is ascending — make it strictly ascending.
+        order = np.argsort(self.wavelength_nm)
+        self.wavelength_nm = self.wavelength_nm[order]
+        self._wl_order = order
+
+    # ------------------------------------------------------------------
+    # Cache key
+    # ------------------------------------------------------------------
+
+    def _atmos_key(self, atmos: AtmosphericState) -> tuple:
+        q = self.cache_quantize
+        def r(val, step):
+            return round(val / step) * step
+        return (
+            r(atmos.water_vapour, q["water_vapour"]),
+            r(atmos.ozone_du, q["ozone_du"]),
+            r(atmos.co2_ppmv, q["co2_ppmv"]),
+            r(atmos.ch4_ppbv, q["ch4_ppbv"]),
+            r(atmos.n2o_ppbv, q["n2o_ppbv"]),
+            r(atmos.co_ppbv, q["co_ppbv"]),
+            r(atmos.surface_altitude_km, q["surface_altitude_km"]),
+        )
+
+    # ------------------------------------------------------------------
+    # Per-layer τ extraction (called on cache miss)
+    # ------------------------------------------------------------------
+
+    def _compute_tau_layers(
+        self, atmos_key: tuple
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Run ARTS to compute layer optical depths for an atmospheric state."""
+        import pyarts
+
+        self._init_ws()
+        ws = self._ws
+
+        (water_vapour, ozone_du, co2_ppmv, ch4_ppbv,
+         n2o_ppbv, co_ppbv, surface_altitude_km) = atmos_key
+
+        # ---- Build a US-Standard atmosphere on n_layers+1 levels ----
+        n_levels = self.n_layers + 1
+        z_surface = surface_altitude_km * 1e3
+        z = np.linspace(z_surface, self.toa_m, n_levels)
+        T = np.where(
+            z < 11e3, 288.15 - 6.5e-3 * z,
+            np.where(z < 20e3, 216.65,
+                     np.where(z < 32e3, 216.65 + 1e-3 * (z - 20e3), 228.65)))
+        T = np.clip(T, 180.0, 320.0)
+        p = 101325.0 * np.exp(-z / 8500.0)
+        p_sorted = np.sort(p)[::-1]
+        sort_idx = np.argsort(p)[::-1]
+
+        ws.p_grid = p_sorted
+        ws.lat_grid = np.array([])
+        ws.lon_grid = np.array([])
+        ws.t_field = pyarts.arts.Tensor3(T[sort_idx].reshape(-1, 1, 1))
+        ws.z_field = pyarts.arts.Tensor3(z[sort_idx].reshape(-1, 1, 1))
+        ws.z_surface = pyarts.arts.Matrix(np.array([[z_surface]]))
+
+        n_sp = 8
+        vmr = np.zeros((n_sp, n_levels, 1, 1))
+        z_s = z[sort_idx]
+        # Reference VMR profiles, scaled by atmos parameters.
+        vmr[0] = 0.01 * np.exp(-z_s.reshape(-1, 1, 1) / 2000.0) * (water_vapour / 1.5)
+        vmr[1] = co2_ppmv * 1e-6
+        vmr[2] = 3e-6 * (ozone_du / 300.0)
+        vmr[3] = n2o_ppbv * 1e-9
+        vmr[4] = ch4_ppbv * 1e-9
+        vmr[5] = co_ppbv * 1e-9
+        vmr[6] = 0.21
+        vmr[7] = 0.78
+        ws.vmr_field = pyarts.arts.Tensor4(vmr)
+
+        # ---- Per-layer propmat extraction ----
+        n_freq = len(np.array(ws.f_grid.value))
+        n_layers = self.n_layers
+        z_arr = z[sort_idx]
+        T_arr = T[sort_idx]
+        z_layers = 0.5 * (z_arr[:-1] + z_arr[1:])
+        T_layers = 0.5 * (T_arr[:-1] + T_arr[1:])
+        p_layers = np.sqrt(p_sorted[:-1] * p_sorted[1:])
+        dz = np.abs(z_arr[1:] - z_arr[:-1])
+
+        tau_layers = np.zeros((n_layers, n_freq), dtype=np.float64)
+        for i in range(n_layers):
+            ws.rtp_pressure = float(p_layers[i])
+            ws.rtp_temperature = float(T_layers[i])
+            ws.rtp_vmr = vmr[:, i, 0, 0].copy()
+            ws.rtp_mag = np.array([0.0, 0.0, 0.0])
+            ws.rtp_los = np.array([0.0, 0.0])
+            ws.rtp_nlte = pyarts.arts.EnergyLevelMap()
+            ws.propmat_clearskyInit()
+            ws.propmat_clearskyAddFromLookup()
+            pm = np.array(ws.propmat_clearsky.value.data)
+            kappa = pm[0, 0, :, 0]
+            tau_layers[i, :] = kappa * dz[i]
+
+        # Reorder along the wavelength axis to match self.wavelength_nm (ascending).
+        tau_layers = tau_layers[:, self._wl_order]
+
+        return (
+            tau_layers.astype(np.float32),
+            T_layers.astype(np.float32),
+            z_layers.astype(np.float32),
+            p_layers.astype(np.float32),
+        )
+
+    def get_tau(self, atmos: AtmosphericState):
+        """Cached τ lookup for an atmospheric state."""
+        key = self._atmos_key(atmos)
+        if key in self._cache:
+            self._n_hits += 1
+            return self._cache[key]
+        self._n_misses += 1
+        result = self._compute_tau_layers(key)
+        self._cache[key] = result
+        return result
+
+    @property
+    def cache_stats(self) -> dict:
+        return {
+            "size": len(self._cache),
+            "hits": self._n_hits,
+            "misses": self._n_misses,
+        }
+
+    # ------------------------------------------------------------------
+    # Public API: forward simulate
+    # ------------------------------------------------------------------
+
+    def simulate(
+        self,
+        surface_reflectance: np.ndarray,
+        atmos: AtmosphericState | None = None,
+        geometry: ViewGeometry | None = None,
+    ) -> SimulationResult:
+        """Compute TOA radiance using cached τ + path integration."""
+        from spectralnp.data.lut import path_integrate
+
+        if atmos is None:
+            atmos = AtmosphericState()
+        if geometry is None:
+            geometry = ViewGeometry()
+
+        tau_layers, T_layers, z_layers, _p_layers = self.get_tau(atmos)
+
+        # Resample reflectance to ARTS wavelength grid if needed.
+        refl = np.asarray(surface_reflectance, dtype=np.float64)
+        if len(refl) != len(self.wavelength_nm):
+            src_wl = np.linspace(
+                self.wavelength_nm[0], self.wavelength_nm[-1], len(refl)
+            )
+            refl = np.interp(self.wavelength_nm, src_wl, refl)
+
+        toa = path_integrate(
+            tau_layers=tau_layers,
+            T_layers=T_layers,
+            z_layers=z_layers,
+            wavelength_nm=self.wavelength_nm,
+            surface_reflectance=refl,
+            solar_zenith_deg=geometry.solar_zenith_deg,
+            sensor_zenith_deg=geometry.sensor_zenith_deg,
+            relative_azimuth_deg=geometry.relative_azimuth_deg,
+            sensor_altitude_m=geometry.sensor_altitude_km * 1e3,
+            surface_altitude_m=atmos.surface_altitude_km * 1e3,
+            surface_temperature_k=atmos.surface_temperature_k or 300.0,
+            aod_550=atmos.aod_550,
+        )
+
+        return SimulationResult(
+            wavelength_nm=self.wavelength_nm.copy(),
+            toa_radiance=toa,
+            surface_reflectance=refl,
+            atmospheric_state=atmos,
+            geometry=geometry,
+        )
+
+
+# ---------------------------------------------------------------------------
 # LUT-backed simulator
 # ---------------------------------------------------------------------------
 
