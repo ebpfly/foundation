@@ -98,9 +98,16 @@ def run_material_benchmark(
                 )
                 if pred.material_probs is None:
                     continue
-                cat_probs = _aggregate_to_category(
-                    pred.material_probs, cat_id_by_idx, n_categories
-                )
+                # New: model now outputs category probabilities directly
+                # (n_classes == 7). Old behaviour was per-spectrum probs
+                # aggregated by category, which is now redundant but the
+                # path is retained for backward compatibility.
+                if pred.material_probs.shape[-1] == n_categories:
+                    cat_probs = pred.material_probs.astype(np.float64)
+                else:
+                    cat_probs = _aggregate_to_category(
+                        pred.material_probs, cat_id_by_idx, n_categories
+                    )
                 cat_probs_list.append(cat_probs)
                 y_true_cat.append(true_cat_id)
                 entropies.append(float(pred.material_entropy) if pred.material_entropy is not None else 0.0)

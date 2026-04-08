@@ -19,7 +19,8 @@ from spectralnp.inference.predict import SpectralNPPredictor
 
 def _ground_truth_reflectance(spec, wl_dense: np.ndarray) -> np.ndarray:
     """Resample the USGS spectrum to the dense grid (no RTM needed)."""
-    refl = np.clip(np.nan_to_num(spec.resample(wl_dense)), 0, 1).astype(np.float32)
+    # Match the dataset graybody fill (ε ≈ 0.96) for wavelengths outside USGS coverage.
+    refl = np.clip(np.nan_to_num(spec.resample(wl_dense), nan=0.04), 0, 1).astype(np.float32)
     return refl
 
 
