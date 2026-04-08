@@ -47,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--d-model", type=int, default=256)
     p.add_argument("--n-layers", type=int, default=6)
     p.add_argument("--z-dim", type=int, default=128)
+    p.add_argument("--spectral-hidden", type=int, default=512)
+    p.add_argument("--spectral-n-layers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
@@ -82,6 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wl-max-nm", type=float, default=None,
                     help="Max wavelength of the dense reconstruction grid (nm). "
                          "Default: 2500 nm (or 16000 nm if --abs-lookup is set).")
+    p.add_argument("--dense-n-points", type=int, default=None,
+                    help="Use a UNIFORM dense grid with this many points "
+                         "instead of the variable-resolution grid. Halves "
+                         "model output cost vs the variable grid.")
     # KL annealing.
     p.add_argument("--kl-warmup-epochs", type=int, default=10,
                     help="Linearly anneal KL weight from 0 to target over this many epochs")
@@ -218,16 +224,26 @@ def main() -> None:
         from spectralnp.data.lut import make_lut_wavelength_grid
         wl_min = args.wl_min_nm if args.wl_min_nm is not None else 300.0
         wl_max = args.wl_max_nm if args.wl_max_nm is not None else 16000.0
-        dense_wl = make_lut_wavelength_grid(wl_min=wl_min, wl_max=wl_max)
-        logger.info(
-            f"Full-spectrum dense grid: {wl_min:.0f}–{wl_max:.0f} nm, "
-            f"{len(dense_wl)} points (variable resolution)"
-        )
+        if args.dense_n_points is not None:
+            dense_wl = np.linspace(wl_min, wl_max, args.dense_n_points)
+            logger.info(
+                f"Uniform dense grid: {wl_min:.0f}–{wl_max:.0f} nm, "
+                f"{len(dense_wl)} points (~{(wl_max-wl_min)/args.dense_n_points:.1f} nm step)"
+            )
+        else:
+            dense_wl = make_lut_wavelength_grid(wl_min=wl_min, wl_max=wl_max)
+            logger.info(
+                f"Full-spectrum dense grid: {wl_min:.0f}–{wl_max:.0f} nm, "
+                f"{len(dense_wl)} points (variable resolution)"
+            )
     else:
         wl_min = args.wl_min_nm if args.wl_min_nm is not None else 380.0
         wl_max = args.wl_max_nm if args.wl_max_nm is not None else 2500.0
-        dense_wl = np.arange(wl_min, wl_max + 1.0, 5.0)
-        logger.info(f"Dense grid: {wl_min:.0f}–{wl_max:.0f} nm, {len(dense_wl)} points @ 5 nm")
+        if args.dense_n_points is not None:
+            dense_wl = np.linspace(wl_min, wl_max, args.dense_n_points)
+        else:
+            dense_wl = np.arange(wl_min, wl_max + 1.0, 5.0)
+        logger.info(f"Dense grid: {wl_min:.0f}–{wl_max:.0f} nm, {len(dense_wl)} points")
 
     # Dataset.
     dataset = SpectralNPDataset(
@@ -252,6 +268,8 @@ def main() -> None:
         d_model=args.d_model,
         n_layers=args.n_layers,
         z_dim=args.z_dim,
+        spectral_hidden=args.spectral_hidden,
+        spectral_n_layers=args.spectral_n_layers,
         n_material_classes=dataset.n_material_classes,
     )
     model = SpectralNP(cfg).to(device)

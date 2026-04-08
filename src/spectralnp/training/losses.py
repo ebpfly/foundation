@@ -20,23 +20,20 @@ def spectral_reconstruction_loss(
     pred_mu: Tensor,
     pred_log_var: Tensor,
     target: Tensor,
+    log_var_min: float = -10.0,
+    log_var_max: float = 10.0,
 ) -> Tensor:
     """Heteroscedastic Gaussian NLL for spectral reconstruction.
 
-    The model predicts both mean and log-variance at each wavelength,
-    so it can express per-wavelength confidence.
+    The model predicts both mean and log-variance at each wavelength.
 
-    Parameters
-    ----------
-    pred_mu : (B, Q) predicted radiance
-    pred_log_var : (B, Q) predicted log-variance
-    target : (B, Q) true radiance
-
-    Returns
-    -------
-    Scalar loss.
+    Stability: ``log_var`` is clamped so that the NLL formula stays
+    bounded. With ``log_var_min=-10`` we cap precision at e^10 ≈ 22000,
+    which prevents the (y-mu)^2 / exp(log_var) term from exploding when
+    the model becomes overconfident on wrong predictions. The clamp is
+    differentiable (straight-through).
     """
-    # Gaussian NLL: 0.5 * (log_var + (y - mu)^2 / exp(log_var))
+    pred_log_var = pred_log_var.clamp(log_var_min, log_var_max)
     precision = torch.exp(-pred_log_var)
     nll = 0.5 * (pred_log_var + precision * (target - pred_mu) ** 2)
     return nll.mean()
@@ -47,7 +44,7 @@ def np_kl_divergence(
     z_log_sigma: Tensor,
     prior_mu: Tensor | None = None,
     prior_log_sigma: Tensor | None = None,
-    log_sigma_min: float = -5.0,
+    log_sigma_min: float = -2.0,
     log_sigma_max: float = 2.0,
     free_bits: float = 0.05,
 ) -> Tensor:
@@ -85,9 +82,13 @@ def np_kl_divergence(
         + (sigma_q_sq + (z_mu - prior_mu) ** 2) / (2 * sigma_p_sq)
         - 0.5
     )
-    # Free bits: floor each dimension's KL at `free_bits`, then sum.
+    # Free bits: floor each dimension's KL at `free_bits`, sum over dims.
     kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
-    return kl_per_dim.sum(dim=-1).mean()
+    kl_total = kl_per_dim.sum(dim=-1).mean()
+    # Soft ceiling: log(1 + KL) keeps gradient flowing for any KL value
+    # but prevents the absolute scale from dominating the total loss when
+    # KL is large (e.g. early training, before posteriors align).
+    return torch.log1p(kl_total)
 
 
 def atmospheric_loss(

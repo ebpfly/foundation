@@ -93,14 +93,23 @@ def diagnose(
     kl_collapse_threshold: float = 1e6,
 ) -> tuple[str, str]:
     """Return (verdict, human-readable message)."""
+    pid_alive = True
     if pid is not None:
         try:
             os.kill(pid, 0)
-        except (ProcessLookupError, PermissionError):
-            return ("crashed", f"PID {pid} not running")
+        except ProcessLookupError:
+            pid_alive = False
+        except PermissionError:
+            pass  # process exists but not ours
 
     if not metrics:
+        # If the process is still running, just early — "warming".
+        # If it's gone, then it crashed before producing any output.
+        if pid_alive:
+            return ("warming", "no epoch lines yet (cache populate / first epoch)")
         return ("crashed", "log file empty or no epoch lines parsed")
+    if pid is not None and not pid_alive:
+        return ("crashed", f"PID {pid} no longer running")
 
     last = metrics[-1]
 
@@ -130,14 +139,24 @@ def diagnose(
         if not all(is_finite(getattr(m, f)) for f in ("loss", "spectral", "kl")):
             return ("nan", f"epoch {m.epoch} contains NaN/Inf")
 
-    # Diverging: spectral loss has grown by ≥3× from its post-warmup minimum
-    # AND the latest 5 epochs have been monotonically increasing in spectral.
+    # Diverging: spectral OR reflectance loss grew by ≥3× from post-warmup minimum.
     spectral_history = [m.spectral for m in post_warmup]
     min_spectral = min(spectral_history)
     if min_spectral > 0 and last.spectral > min_spectral * 3.0:
         return ("diverging",
                 f"epoch {last.epoch} spectral={last.spectral:.4g} >> "
                 f"min={min_spectral:.4g} (×{last.spectral/min_spectral:.1f})")
+
+    # Reflectance NLL can be negative (well-calibrated Gaussian), so use
+    # the absolute swing relative to min: if it grew by 5+ from its min
+    # AND is now positive, that's a divergence.
+    refl_history = [m.reflectance for m in post_warmup]
+    min_refl = min(refl_history)
+    swing = last.reflectance - min_refl
+    if swing > 5.0 and last.reflectance > 0.5:
+        return ("diverging",
+                f"epoch {last.epoch} reflectance={last.reflectance:.4g} "
+                f"(min was {min_refl:.4g}, swing +{swing:.2f})")
 
     # Stalled: spectral loss hasn't improved in the last `stall_window` epochs
     if len(post_warmup) >= stall_window:
