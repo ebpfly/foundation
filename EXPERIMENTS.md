@@ -378,3 +378,20 @@ Obs-point fidelity passes from epoch 70 onwards.
 1. ✓ RMSE decreases with more bands (factor 3.15×)
 2. ✓ Obs-point fidelity steady/improving
 3. ✓ Coverage@400 within [80%, 99%] (89.4%)
+
+### Benchmark results (best radiance-only model, epoch 70)
+
+Evaluated on 50 held-out USGS spectra with real sensor definitions:
+
+| Sensor       | bands | R²    | SAM°  | Coverage@2σ |
+|-------------|-------|-------|-------|-------------|
+| Landsat-8    |     7 | 0.970 | 6.4°  | 67%         |
+| Sentinel-2   |    13 | 0.980 | 5.2°  | 68%         |
+| ENMAP        |   246 | 0.987 | 4.1°  | 93%         |
+| AVIRIS-NG    |   425 | 0.987 | 4.0°  | 94%         |
+
+R²=0.987 with 94% coverage at hyperspectral resolution.
+Reflectance and material heads were disabled (random weights).
+
+Multi-head training (radiance + reflectance + material + atmos)
+is now running with all the architectural fixes applied.
