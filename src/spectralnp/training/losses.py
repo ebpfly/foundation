@@ -22,20 +22,34 @@ def spectral_reconstruction_loss(
     target: Tensor,
     log_var_min: float = -7.0,
     log_var_max: float = 4.0,
+    beta_nll: float = 0.5,
 ) -> Tensor:
     """Heteroscedastic Gaussian NLL for spectral reconstruction.
 
-    The model predicts both mean and log-variance at each wavelength.
+    Uses **β-NLL** (Seitzer et al., 2022) to prevent variance collapse.
+    Standard NLL has an asymmetric incentive: correct predictions push σ↓
+    (free loss reduction), while wrong predictions push σ↑ (costly).
+    The model learns to set σ at the floor. β-NLL re-weights each sample's
+    loss by ``σ^(2β)`` which dampens the "I'm right, shrink σ" gradient.
 
-    Stability: ``log_var`` is clamped so that the NLL formula stays
-    bounded. With ``log_var_min=-10`` we cap precision at e^10 ≈ 22000,
-    which prevents the (y-mu)^2 / exp(log_var) term from exploding when
-    the model becomes overconfident on wrong predictions. The clamp is
-    differentiable (straight-through).
+    β=0 → standard NLL (variance collapses).
+    β=0.5 → balanced: the gradient on log_var from correct predictions
+             is exactly offset by the gradient from wrong predictions.
+    β=1 → MSE only (ignores variance entirely).
+
+    Stability: ``log_var`` is clamped to ``[log_var_min, log_var_max]``.
     """
     pred_log_var = pred_log_var.clamp(log_var_min, log_var_max)
     precision = torch.exp(-pred_log_var)
     nll = 0.5 * (pred_log_var + precision * (target - pred_mu) ** 2)
+
+    if beta_nll > 0:
+        # β-NLL: weight each sample's loss by detached σ^(2β).
+        # The detach prevents the weighting from introducing bias in the
+        # gradient on the mean — only the variance gradient is rebalanced.
+        weight = torch.exp(beta_nll * pred_log_var.detach())
+        nll = nll * weight
+
     return nll.mean()
 
 

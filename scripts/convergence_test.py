@@ -369,6 +369,20 @@ def main():
         print(f"  Coverage@2σ = {cov_400:.1%} at {BAND_COUNTS[-1]} bands (should be ~95%).")
         print("  Predicted uncertainty is too wide.")
 
+    # Post-hoc temperature scaling diagnostic: compute the optimal
+    # temperature T such that (y - μ) / (T·σ) is standard normal.
+    all_z = []
+    for r in data["results"]:
+        z = (data["truth"] - r["pred_mean"]) / np.maximum(r["pred_std"], 1e-9)
+        all_z.extend(z.tolist())
+    z_arr = np.array(all_z)
+    T_opt = float(z_arr.std())
+    cov_posthoc = float(np.mean(np.abs(z_arr / T_opt) < 2))
+    print()
+    print(f"  Post-hoc temperature scaling:")
+    print(f"    Optimal T (σ multiplier):        {T_opt:.1f}")
+    print(f"    Coverage@2σ after T-scaling:      {cov_posthoc:.1%}")
+
     # Multi-spectrum eval: average convergence metrics over many random
     # spectra to confirm the visual single-spectrum result generalises.
     if args.n_eval_spectra > 0:
