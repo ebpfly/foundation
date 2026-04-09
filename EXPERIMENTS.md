@@ -250,3 +250,25 @@ the latent size.
 Observation-point fidelity still degrades with more bands regardless
 of z_dim or aggregation method. This is a fundamental limit of the
 current latent-bottleneck architecture.
+
+### `iter_flatten` — flatten queries instead of mean-pool
+
+StochasticEncoder now flattens K×d_model attended queries (4096 dims)
+and projects directly to z_dim, instead of mean-pooling to d_model
+(128 dims) first. 32× more intermediate capacity.
+
+| Epoch | Held-out RMSE@400 | Factor | T  | Coverage@400 |
+|-------|-------------------|--------|----|--------------|
+| 10    | 13.45             | 2.02×  | 15 | 2.1%         |
+| 20    | ---               | 1.25×  | -- | 0.7%         |
+| 30    | ---               | 1.36×  | -- | 9.4%         |
+| 50    | 6.02              | 2.41×  | 51 | 9.4%         |
+
+**Vs mean-pool (iter_vae) at epoch 50:**
+- Coverage: 9.4% vs 3.5% (2.7× better native calibration)
+- Post-hoc T: 51 vs 202 (4× closer to ideal T=1)
+- RMSE: 6.0 vs 5.0 (slightly worse)
+- Factor: 2.41× vs 3.93× (worse)
+
+Trade-off: richer intermediate representation gives better calibration
+but harder optimization. Obs-point fidelity still degrades 3→400 bands.
