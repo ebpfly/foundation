@@ -72,3 +72,62 @@ Variable-length batches are handled by `collate_spectral_batch()` which pads to 
 ### Inference (`src/spectralnp/inference/`)
 
 `SpectralNPPredictor` wraps the model for single-observation or mixed-sensor batch prediction. `predict_with_uncertainty()` draws multiple z samples and reports mean ± std across samples. Mixed-sensor batches (different instruments per sample) work via padding.
+
+## Experiment Log
+
+`EXPERIMENTS.md` documents every training run, what was tried, why, and the result. **Update this file** after every iteration — it's the single source of truth for what's been tested and what worked.
+
+## Iteration Workflow
+
+Use the fast-iteration loop to test architectural and loss changes:
+
+```bash
+# Quick 5-epoch experiment (~5 min):
+scripts/iterate.sh <experiment_name> [extra pretrain args]
+
+# Example: test a new loss weight
+scripts/iterate.sh my_experiment --w-kl 0.001
+
+# The script automatically:
+# 1. Trains for 5 epochs with a small model
+# 2. Runs the convergence test on the result
+# 3. Saves convergence_<name>.png
+# 4. Commits + pushes the result
+```
+
+The **convergence test** (`scripts/convergence_test.py`) is the definitive pass/fail signal. A working model must show:
+1. **RMSE decreases** with more input bands (factor > 2×)
+2. **Sharpness decreases** with more input bands (ratio > 1)
+3. **Coverage@2σ ≈ 95%** (well-calibrated uncertainty)
+
+Use `--temperature 0` to apply post-hoc temperature scaling and see what calibration WOULD look like with correct variance scale.
+
+For longer training runs:
+```bash
+# 50-100 epoch run (~35-70 min with simplified RTM):
+python -m spectralnp.training.pretrain \
+    --usgs-data /path/to/USGS_ASCIIdata/ASCIIdata_splib07a \
+    --output-dir checkpoints/<name> \
+    --epochs 50 --samples-per-epoch 5000 --lr 5e-4 --lr-constant \
+    --no-r-in-decoder \
+    [other flags]
+```
+
+After training, always run the convergence test and update EXPERIMENTS.md.
+
+### Training data validation
+
+```bash
+python scripts/validate_training_data.py \
+    --usgs-data /path/to/USGS_ASCIIdata/ASCIIdata_splib07a
+```
+
+Runs 41 automated tests on the training inputs and targets (shapes, ranges, physics sanity, sensor convolution, bandwidth, target consistency). Should pass 100%.
+
+### Training watchdog
+
+```bash
+python scripts/training_watchdog.py /tmp/training.log --pid <PID>
+```
+
+Parses training log and detects NaN, KL collapse, divergence, or stall. Exit code 0 = ok, nonzero = problem.
