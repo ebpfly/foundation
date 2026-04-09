@@ -438,3 +438,15 @@ Convergence test (held-out synthetic spectra):
   Coverage@400 = 88.9%
   Obs trend    = ✓ steady/improving
   Post-hoc T   = 3.4
+
+### Reflectance aleatoric fix + re-benchmark
+
+Same fix as radiance: include decoder log_var in reflectance_std.
+Coverage jumps from 2-3% to 63-79% without retraining.
+
+| Sensor     | R²    | SAM°  | Cov (before) | **Cov (after)** |
+|-----------|-------|-------|-------------|-----------------|
+| Landsat-8  | 0.61  | 15.1° | 1.5%        | **63%**         |
+| Sentinel-2 | 0.62  | 12.6° | 1.8%        | **68%**         |
+| ENMAP      | 0.78  | 9.7°  | 2.8%        | **79%**         |
+| AVIRIS-NG  | 0.78  | 9.7°  | 2.7%        | **79%**         |

@@ -341,6 +341,7 @@ class SpectralNP(nn.Module):
         spectral_samples = []       # s_mu per z-sample
         spectral_logvar_samples = [] # s_logvar per z-sample (aleatoric)
         reflectance_samples = []
+        reflectance_logvar_samples = []
         material_logit_samples = []
         atmos_gamma_samples = []
         atmos_epistemic_samples = []
@@ -356,6 +357,7 @@ class SpectralNP(nn.Module):
                 spectral_logvar_samples.append(s_logvar)
                 rho_mu, rho_logvar = self.reflectance_decoder(r, z, query_wavelength, query_fwhm)
                 reflectance_samples.append(rho_mu)
+                reflectance_logvar_samples.append(rho_logvar)
 
             material_logit_samples.append(self.material_decoder(r, z))
 
@@ -376,7 +378,9 @@ class SpectralNP(nn.Module):
         if reflectance_samples:
             rho_stack = torch.stack(reflectance_samples)
             results["reflectance_mean"] = rho_stack.mean(0)
-            results["reflectance_std"] = rho_stack.std(0)
+            rho_epistemic_var = rho_stack.var(0)
+            rho_aleatoric_var = torch.stack(reflectance_logvar_samples).exp().mean(0)
+            results["reflectance_std"] = (rho_epistemic_var + rho_aleatoric_var).sqrt()
 
         mat_stack = torch.stack(material_logit_samples)
         mat_probs = mat_stack.softmax(dim=-1).mean(0)
