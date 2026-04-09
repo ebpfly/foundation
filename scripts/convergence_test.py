@@ -297,6 +297,9 @@ def main():
     p.add_argument("--n-eval-spectra", type=int, default=10,
                    help="Number of additional held-out spectra to average "
                         "convergence metrics across (in addition to the visual one)")
+    p.add_argument("--held-out", action="store_true",
+                   help="Use SYNTHETIC spectra (never seen in training) for the "
+                        "multi-spectrum eval. Critical for detecting memorisation.")
     p.add_argument("--n-samples", type=int, default=32)
     p.add_argument("--snr", type=float, default=200.0)
     p.add_argument("--seed", type=int, default=42)
@@ -424,18 +427,28 @@ def main():
     # Multi-spectrum eval: average convergence metrics over many random
     # spectra to confirm the visual single-spectrum result generalises.
     if args.n_eval_spectra > 0:
-        rng2 = np.random.default_rng(args.seed + 1000)
-        eval_spec_indices = rng2.choice(
-            len(speclib), size=min(args.n_eval_spectra, len(speclib)),
-            replace=False,
-        )
+        if args.held_out:
+            # Use SYNTHETIC spectra that were NEVER in training.
+            from spectralnp.data.synthetic_speclib import generate_synthetic_library
+            held_out_lib = generate_synthetic_library(
+                n_per_class=max(args.n_eval_spectra // 5, 5), seed=99999
+            )
+            eval_spectra = held_out_lib.spectra[:args.n_eval_spectra]
+            label = "held-out SYNTHETIC"
+        else:
+            rng2 = np.random.default_rng(args.seed + 1000)
+            eval_spec_indices = rng2.choice(
+                len(speclib), size=min(args.n_eval_spectra, len(speclib)),
+                replace=False,
+            )
+            eval_spectra = [speclib.spectra[int(i)] for i in eval_spec_indices]
+            label = "training-set USGS"
         rmse_3, rmse_400, sharp_3, sharp_400 = [], [], [], []
-        for ei in eval_spec_indices:
-            spec_e = speclib.spectra[int(ei)]
+        for si, spec_e in enumerate(eval_spectra):
             data_e = run_convergence(
                 predictor, spec_e, dense_wl, atmos, geom,
                 band_counts=BAND_COUNTS, n_samples=args.n_samples,
-                snr=args.snr, seed=args.seed + int(ei),
+                snr=args.snr, seed=args.seed + si,
             )
             m_e = compute_metrics(data_e)
             rmse_3.append(m_e["rmse_vs_truth"][0])
@@ -447,7 +460,7 @@ def main():
         sharp_3 = np.array(sharp_3)
         sharp_400 = np.array(sharp_400)
         print()
-        print(f"=== Averaged over {len(eval_spec_indices)} held-out spectra ===")
+        print(f"=== Averaged over {len(eval_spectra)} spectra ({label}) ===")
         print(f"  RMSE@3:      mean {rmse_3.mean():.3f}  median {np.median(rmse_3):.3f}")
         print(f"  RMSE@400:    mean {rmse_400.mean():.3f}  median {np.median(rmse_400):.3f}")
         print(f"  RMSE factor: mean {(rmse_3/np.maximum(rmse_400,1e-9)).mean():.2f}×")

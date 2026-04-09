@@ -195,10 +195,37 @@ class SpectralNPDataset(Dataset):
             sensor_altitude_km=self.rng.choice([20, 100, 400, 700, 800]),
         )
 
+    def _augment_reflectance(self, reflectance: np.ndarray) -> np.ndarray:
+        """Augment a surface reflectance spectrum to increase diversity.
+
+        Without augmentation, the model memorizes the 1748 USGS spectra
+        (factor 6.63× on training vs 1.27× on held-out). Augmentation
+        forces the model to learn spectral physics, not a lookup table.
+        """
+        refl = reflectance.copy()
+
+        # 1. Spectral mixing: blend with another random spectrum (50% chance)
+        if self.rng.random() < 0.5:
+            other_idx = self.rng.integers(0, self.n_spectra)
+            other = self.reflectance_matrix[other_idx]
+            alpha = self.rng.uniform(0.2, 0.8)
+            refl = alpha * refl + (1 - alpha) * other
+
+        # 2. Random scale + offset (always applied)
+        scale = self.rng.uniform(0.7, 1.3)
+        offset = self.rng.uniform(-0.03, 0.03)
+        refl = refl * scale + offset
+
+        # 3. Per-wavelength Gaussian noise (always applied, small)
+        noise_std = self.rng.uniform(0.005, 0.02)
+        refl = refl + self.rng.normal(0, noise_std, size=refl.shape).astype(np.float32)
+
+        return np.clip(refl, 0.0, 1.0).astype(np.float32)
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        # 1. Sample a surface reflectance.
+        # 1. Sample a surface reflectance + augment.
         spec_idx = self.rng.integers(0, self.n_spectra)
-        reflectance = self.reflectance_matrix[spec_idx]  # (W,)
+        reflectance = self._augment_reflectance(self.reflectance_matrix[spec_idx])
 
         # 2. Simulate at-sensor radiance.
         if self._arts_sim is not None and self._arts_sim._scenes:
