@@ -49,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--z-dim", type=int, default=128)
     p.add_argument("--spectral-hidden", type=int, default=512)
     p.add_argument("--spectral-n-layers", type=int, default=4)
+    p.add_argument("--n-frequencies", type=int, default=64,
+                    help="Number of sinusoidal frequencies in the spectral "
+                         "positional encoding. Default 64 resolves ~33nm. "
+                         "256 resolves ~4nm (matches 5nm dense grid).")
     p.add_argument("--no-r-in-decoder", action="store_true",
                     help="Drop the deterministic representation r from the "
                          "spectral decoder input. Forces the decoder to depend "
@@ -294,6 +298,7 @@ def main() -> None:
         d_model=args.d_model,
         n_layers=args.n_layers,
         z_dim=args.z_dim,
+        n_frequencies=args.n_frequencies,
         spectral_hidden=args.spectral_hidden,
         spectral_n_layers=args.spectral_n_layers,
         spectral_decoder_use_r=not args.no_r_in_decoder,
