@@ -98,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     # KL annealing.
     p.add_argument("--kl-warmup-epochs", type=int, default=10,
                     help="Linearly anneal KL weight from 0 to target over this many epochs")
+    p.add_argument("--lr-constant", action="store_true",
+                    help="Use constant LR (no cosine decay) — useful for short iteration runs")
     return p
 
 
@@ -287,7 +289,11 @@ def main() -> None:
     optimiser = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
+    if args.lr_constant:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_lambda=lambda _: 1.0)
+        logger.info("Using constant LR (no cosine decay).")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
 
     # Loss.
     # Class-balanced material loss: weights inversely proportional to category size.
