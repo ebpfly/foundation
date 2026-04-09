@@ -162,3 +162,25 @@ d_model=128, n_layers=4, z_dim=128, NLL loss.
 
 **Pending**: CRPS loss should give good calibration WITHOUT post-hoc
 scaling. Running now.
+
+### Summary: variance collapse is architectural, not loss-related
+
+All three losses tested (NLL, β-NLL, CRPS) converge to the same
+failure: variance collapses as mean accuracy improves. The issue is
+that the same final MLP layer outputs both μ and log_var — features
+optimize for accuracy and drag log_var to the floor.
+
+| Loss    | Epoch | RMSE@400 | Coverage@2σ | Post-hoc T |
+|---------|-------|----------|-------------|------------|
+| NLL     | 50    | 5.7      | 0.5%        | 163        |
+| β-NLL   | 20    | 6.0      | 0.7%        | 68         |
+| CRPS    | 40    | 3.3      | 1.6%        | 174        |
+
+HOWEVER: post-hoc temperature scaling (T≈170) gives 94-98% coverage
+with ALL losses. The model's **relative uncertainty** is correct — it
+just needs a single scalar correction.
+
+**Next steps (in priority order)**:
+1. Accept T-scaling for now; focus on other priorities (LWIR, multi-head)
+2. Later: separate mean and variance into two independent networks
+3. Or: two-phase training (freeze mean, train variance head separately)
