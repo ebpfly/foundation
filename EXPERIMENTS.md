@@ -395,3 +395,24 @@ Reflectance and material heads were disabled (random weights).
 
 Multi-head training (radiance + reflectance + material + atmos)
 is now running with all the architectural fixes applied.
+
+### `iter_full` — multi-head with all fixes (PRODUCTION MODEL)
+
+All 4 heads (radiance + reflectance + material + atmos) + all fixes:
+n_freq=256, flatten, no-r, CRPS, KL=0.01, PCA-VAE augmentation.
+
+| Epoch | RMSE@400 | Factor | Obs@400 | Coverage@400 | T    |
+|-------|----------|--------|---------|--------------|------|
+| 10    | 14.30    | 1.07×  | 19.27   | 77.2%        | ---  |
+| 30    | 8.14     | 2.15×  | 11.98   | **97.4%**    | ~1.0 |
+| 50    | **5.00** | 2.63×  | **4.24**| **97.4%**    | ~1.0 |
+
+**Coverage holds at 97.4% for 20+ epochs** — multi-task regularization
+from the other heads prevents the variance collapse that plagued every
+single-head experiment. The model is natively calibrated (T≈1.0).
+
+Multi-head training also benefits from:
+- Shared encoder learns better representations
+- Reflectance head provides atmospheric-correction signal
+- Atmospheric head grounds the latent in physical parameters
+- Material head adds classification regularization
