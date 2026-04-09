@@ -184,3 +184,29 @@ just needs a single scalar correction.
 1. Accept T-scaling for now; focus on other priorities (LWIR, multi-head)
 2. Later: separate mean and variance into two independent networks
 3. Or: two-phase training (freeze mean, train variance head separately)
+
+### CRITICAL: model is memorizing, not generalizing
+
+Tested CRPS epoch 40 model on SYNTHETIC spectra (never seen in training):
+
+  n_bands | Training RMSE | Held-out RMSE
+  --------|---------------|---------------
+       10 |         ~20   |    5.66
+       50 |          ~8   |    3.93
+      400 |         3.34  |    4.06
+
+Convergence factor drops from 6.63× (training) to 1.27× (held-out).
+The model is memorizing 1748 USGS spectra, not learning spectral physics.
+
+The variance collapse also makes more sense: the model IS confident
+because it's seen these exact spectra 250k+ times.
+
+**Root cause**: 1748 unique surface spectra in a 1.6M-parameter decoder
+= easy to memorize. Random atmosphere/geometry/sensor augmentation helps
+but doesn't change the underlying spectra.
+
+**Fixes needed**:
+1. Data augmentation: spectral mixing, random perturbations, noise
+2. Proper train/test split: hold out 20% of USGS, test on those
+3. Convergence test must use held-out spectra as primary metric
+4. Possibly: simpler model (fewer decoder parameters)
