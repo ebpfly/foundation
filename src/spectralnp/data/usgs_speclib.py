@@ -1,8 +1,11 @@
 """USGS Spectral Library v7 loader.
 
-Parses the USGS Spectral Library v7 (splib07a) ASCII data.
+Parses the USGS Spectral Library v7 (splib07a and splib07b) ASCII data.
 The library uses single-column reflectance files with separate
 wavelength/bandpass files per spectrometer (ASD, Beckman, Nicolet, AVIRIS).
+
+Both versions share the same format — only the filename prefix and header
+differ (``splib07a`` vs ``splib07b``).
 
 Sentinel value -1.23e+34 marks deleted/bad channels.
 """
@@ -171,7 +174,7 @@ def _parse_spectrum(
     lines = text.strip().splitlines()
     name = lines[0].strip() if lines else filepath.split("/")[-1]
     # Clean up the record prefix.
-    name = re.sub(r"^splib07a\s+Record=\d+:\s*", "", name).strip()
+    name = re.sub(r"^splib07[ab]\s+Record=\d+:\s*", "", name).strip()
 
     spectrometer = _detect_spectrometer(filepath) or ""
     category = _detect_category(filepath)
@@ -309,3 +312,32 @@ def load_from_directory(data_dir: str | Path) -> SpectralLibrary:
             spectra.append(spec)
 
     return SpectralLibrary(spectra)
+
+
+def load_combined(*data_dirs: str | Path) -> SpectralLibrary:
+    """Load and deduplicate spectra from multiple splib07 directories.
+
+    Accepts any mix of splib07a / splib07b directories (or zips).
+    Spectra are deduplicated by (name, spectrometer) — if the same
+    material+instrument appears in both libraries, the later directory wins.
+
+    Example::
+
+        lib = load_combined(
+            "/path/to/ASCIIdata_splib07a",
+            "/path/to/ASCIIdata_splib07b",
+        )
+    """
+    seen: dict[tuple[str, str], Spectrum] = {}
+
+    for data_dir in data_dirs:
+        data_dir = Path(data_dir)
+        if data_dir.suffix == ".zip":
+            lib = load_from_zip(data_dir)
+        else:
+            lib = load_from_directory(data_dir)
+        for s in lib.spectra:
+            key = (s.name, s.spectrometer)
+            seen[key] = s
+
+    return SpectralLibrary(list(seen.values()))

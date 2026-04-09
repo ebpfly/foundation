@@ -87,6 +87,49 @@ Variable-length batches are handled by `collate_spectral_batch()` which pads to 
 
 `pretrain.py` is the CLI entry point with KL annealing (linear warmup), AdamW + cosine LR, gradient clipping at 1.0, and optional W&B logging.
 
+### Spectral Generators (`src/spectralnp/model/pca_vae.py`)
+
+PCA-latent VAE for generating novel reflectance spectra. Projects spectra into PCA space, trains a small MLP-VAE on PCA coefficients, then maps back to spectral space. Uses a fitted aggregate posterior (`fit_latent_prior`) for realistic sampling instead of N(0,I).
+
+Two pre-configured ranges:
+- **SWIR** (350–2500 nm): 64 PCA components, 16-dim latent, trained on ASD spectra (~1,748 spectra)
+- **TIR** (6–15 μm): 20 PCA components, 12-dim latent, trained on NIC4 spectra (~604 spectra)
+
+```bash
+# Train SWIR generator
+python -m spectralnp.training.train_pca_vae \
+    --usgs-data /path/to/ASCIIdata_splib07a \
+    --wavelength-lo 350 --wavelength-hi 2500 --wavelength-step 1 \
+    --n-pca 64 --z-dim 16 --beta 0.01 --beta-warmup 50 \
+    --epochs 300 --augment --output-dir checkpoints/pca_vae_swir
+
+# Train TIR generator
+python -m spectralnp.training.train_pca_vae \
+    --usgs-data /path/to/ASCIIdata_splib07a \
+    --spectrometer NIC4 \
+    --wavelength-lo 6000 --wavelength-hi 15000 --wavelength-step 10 \
+    --n-pca 20 --z-dim 12 --beta 0.01 --beta-warmup 50 \
+    --epochs 300 --augment --output-dir checkpoints/pca_vae_tir
+
+# Generate spectra from a trained checkpoint
+python -c "
+import torch
+from spectralnp.model.pca_vae import PCAVAE, PCAVAEConfig
+ckpt = torch.load('checkpoints/pca_vae_swir/final.pt', map_location='cpu', weights_only=False)
+model = PCAVAE(ckpt['config'])
+# Resize dynamic buffers before loading state dict
+for k in ['pca_mean','pca_components','pca_singular_values','z_mean','z_cholesky']:
+    if k in ckpt['model_state_dict']:
+        setattr(model, k, torch.zeros_like(ckpt['model_state_dict'][k]))
+model.load_state_dict(ckpt['model_state_dict'])
+spectra = model.generate(n_samples=100)  # (100, n_wavelengths)
+"
+```
+
+Key parameters: `--n-pca` controls smoothness (lower = smoother, higher = more detail but noisier). `--beta` controls KL weight (keep low ~0.01 for sharp reconstructions; the fitted latent prior handles generation quality). Training takes ~3 minutes on MPS.
+
+The USGS loader (`usgs_speclib.py`) supports both splib07a and splib07b formats. Use `load_combined()` to load and deduplicate across multiple library directories.
+
 ### Inference (`src/spectralnp/inference/`)
 
 `SpectralNPPredictor` wraps the model for single-observation or mixed-sensor batch prediction. `predict_with_uncertainty()` draws multiple z samples and reports mean ± std across samples. Mixed-sensor batches (different instruments per sample) work via padding.
