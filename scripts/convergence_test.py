@@ -256,9 +256,12 @@ def main():
                    help="USGS spectral library directory or zip")
     p.add_argument("--output", type=str, default="convergence_test.png")
     p.add_argument("--category", type=str, default="vegetation",
-                   help="USGS category to pick a test spectrum from")
+                   help="USGS category to pick a test spectrum from (visual plot)")
     p.add_argument("--spec-index", type=int, default=2,
-                   help="Index within the category")
+                   help="Index within the category (visual plot)")
+    p.add_argument("--n-eval-spectra", type=int, default=10,
+                   help="Number of additional held-out spectra to average "
+                        "convergence metrics across (in addition to the visual one)")
     p.add_argument("--n-samples", type=int, default=32)
     p.add_argument("--snr", type=float, default=200.0)
     p.add_argument("--seed", type=int, default=42)
@@ -321,6 +324,40 @@ def main():
         print("  >>> POSTERIOR COLLAPSE DETECTED <<<")
         print("  Model produces ~identical predictions regardless of band count.")
         print("  Decoder is ignoring the latent z. KL regularization too strong.")
+
+    # Multi-spectrum eval: average convergence metrics over many random
+    # spectra to confirm the visual single-spectrum result generalises.
+    if args.n_eval_spectra > 0:
+        rng2 = np.random.default_rng(args.seed + 1000)
+        eval_spec_indices = rng2.choice(
+            len(speclib), size=min(args.n_eval_spectra, len(speclib)),
+            replace=False,
+        )
+        rmse_3, rmse_400, sharp_3, sharp_400 = [], [], [], []
+        for ei in eval_spec_indices:
+            spec_e = speclib.spectra[int(ei)]
+            data_e = run_convergence(
+                predictor, spec_e, dense_wl, atmos, geom,
+                band_counts=BAND_COUNTS, n_samples=args.n_samples,
+                snr=args.snr, seed=args.seed + int(ei),
+            )
+            m_e = compute_metrics(data_e)
+            rmse_3.append(m_e["rmse_vs_truth"][0])
+            rmse_400.append(m_e["rmse_vs_truth"][-1])
+            sharp_3.append(m_e["sharpness"][0])
+            sharp_400.append(m_e["sharpness"][-1])
+        rmse_3 = np.array(rmse_3)
+        rmse_400 = np.array(rmse_400)
+        sharp_3 = np.array(sharp_3)
+        sharp_400 = np.array(sharp_400)
+        print()
+        print(f"=== Averaged over {len(eval_spec_indices)} held-out spectra ===")
+        print(f"  RMSE@3:      mean {rmse_3.mean():.3f}  median {np.median(rmse_3):.3f}")
+        print(f"  RMSE@400:    mean {rmse_400.mean():.3f}  median {np.median(rmse_400):.3f}")
+        print(f"  RMSE factor: mean {(rmse_3/np.maximum(rmse_400,1e-9)).mean():.2f}×")
+        print(f"  Sharp@3:     mean {sharp_3.mean():.3f}")
+        print(f"  Sharp@400:   mean {sharp_400.mean():.3f}")
+        print(f"  Sharp ratio: mean {(sharp_3/np.maximum(sharp_400,1e-9)).mean():.2f}× (>1 = correct)")
 
     out = Path(args.output)
     make_plot(data, metrics, out)
