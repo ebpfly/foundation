@@ -214,34 +214,53 @@ def make_plot(
         row = 1 + i // 4
         col = i % 4
         ax = fig.add_subplot(gs[row, col])
-        ax.plot(dense_wl, truth, color="black", linewidth=0.8, alpha=0.5,
-                label="true")
-        ax.plot(dense_wl, r["pred_mean"], color="#3498db", linewidth=1.2,
-                label="predicted")
+
+        pred = r["pred_mean"]
+        std = r["pred_std"]
+        cov = metrics["coverage_2sigma"][i]
+
+        # Show the actual error as a shaded region so the user can see
+        # whether the predicted ±2σ is appropriately sized.
+        error = np.abs(pred - truth)
         ax.fill_between(
             dense_wl,
-            r["pred_mean"] - 2 * r["pred_std"],
-            r["pred_mean"] + 2 * r["pred_std"],
-            color="#3498db", alpha=0.25, label="±2σ",
+            pred - error,
+            pred + error,
+            color="#e74c3c", alpha=0.15, label="actual error",
         )
+        # Predicted ±2σ — draw even if very thin, with a visible edge.
+        ax.fill_between(
+            dense_wl,
+            pred - 2 * std,
+            pred + 2 * std,
+            color="#3498db", alpha=0.35, label="predicted ±2σ",
+        )
+        ax.plot(dense_wl, truth, color="black", linewidth=0.8, alpha=0.5,
+                label="true")
+        ax.plot(dense_wl, pred, color="#3498db", linewidth=1.2,
+                label="predicted")
         ax.scatter(r["input_wl"], r["input_rad"], s=8, color="black",
                    zorder=5)
-        ax.set_title(f"{r['n_bands']} bands "
-                     f"(RMSE={metrics['rmse_vs_truth'][i]:.2f})",
-                     fontsize=10)
+
+        # Coverage color: green if near 95%, red if way off.
+        cov_color = "#27ae60" if 0.80 < cov < 0.99 else "#e74c3c"
+        ax.set_title(
+            f"{r['n_bands']} bands — RMSE={metrics['rmse_vs_truth'][i]:.1f}\n"
+            f"cov@2σ={cov:.0%} (target 95%)",
+            fontsize=9, color=cov_color, fontweight="bold",
+        )
         ax.set_xlim(dense_wl[0], dense_wl[-1])
         if col == 0:
             ax.set_ylabel("radiance")
         if row == n_rows:
             ax.set_xlabel("wavelength (nm)")
         if i == 0:
-            ax.legend(fontsize=7, loc="upper right")
+            ax.legend(fontsize=6, loc="upper right")
         ax.grid(alpha=0.3)
 
     fig.suptitle(
         f"Convergence test — {data['spec_name']} ({data['category']})\n"
-        f"PASS criteria: RMSE↓ with n_bands, sharpness↓, mean diversity > 0.5, "
-        f"min→max ΔRMSE > 1.0",
+        f"PASS: RMSE↓ with n_bands, sharpness↓, coverage@2σ ∈ [80%, 99%]",
         fontsize=13, fontweight="bold", y=1.0,
     )
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
@@ -319,11 +338,36 @@ def main():
     print(f"  Sharpness @ {BAND_COUNTS[0]} bands:                     {metrics['sharpness'][0]:.4f}")
     print(f"  Sharpness @ {BAND_COUNTS[-1]} bands:                    {metrics['sharpness'][-1]:.4f}")
 
+    # Coverage @ 2σ (calibration check)
+    cov_3 = metrics["coverage_2sigma"][0]
+    cov_400 = metrics["coverage_2sigma"][-1]
+    print(f"  Coverage@2σ @ {BAND_COUNTS[0]} bands:                   {cov_3:.1%}")
+    print(f"  Coverage@2σ @ {BAND_COUNTS[-1]} bands:                  {cov_400:.1%}")
+    print(f"  Target coverage@2σ:                       95%")
+    ideal = 0.9545
+    calib_err_3 = abs(cov_3 - ideal)
+    calib_err_400 = abs(cov_400 - ideal)
+    print(f"  Calibration error @ {BAND_COUNTS[0]} bands:              {calib_err_3:.1%}")
+    print(f"  Calibration error @ {BAND_COUNTS[-1]} bands:             {calib_err_400:.1%}")
+
     if metrics["mean_diversity"] < 0.05 or metrics["rmse_min_to_max"] < 0.05:
         print()
         print("  >>> POSTERIOR COLLAPSE DETECTED <<<")
         print("  Model produces ~identical predictions regardless of band count.")
         print("  Decoder is ignoring the latent z. KL regularization too strong.")
+
+    if cov_400 < 0.10:
+        print()
+        print("  >>> WILDLY OVERCONFIDENT <<<")
+        print(f"  Coverage@2σ = {cov_400:.1%} at {BAND_COUNTS[-1]} bands (should be ~95%).")
+        print(f"  Predicted σ is {metrics['sharpness'][-1]:.4f} but RMSE is "
+              f"{metrics['rmse_vs_truth'][-1]:.2f} — uncertainty is "
+              f"~{metrics['rmse_vs_truth'][-1] / max(metrics['sharpness'][-1], 1e-9):.0f}× too small.")
+    elif cov_400 > 0.99:
+        print()
+        print("  >>> UNDERCONFIDENT <<<")
+        print(f"  Coverage@2σ = {cov_400:.1%} at {BAND_COUNTS[-1]} bands (should be ~95%).")
+        print("  Predicted uncertainty is too wide.")
 
     # Multi-spectrum eval: average convergence metrics over many random
     # spectra to confirm the visual single-spectrum result generalises.
