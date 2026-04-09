@@ -321,3 +321,26 @@ as iter_flatten (z=256, flatten, CRPS, KL=0.01, PCA-VAE augmented).
 The spectral resolution bottleneck was a bigger factor than z_dim or
 aggregation method. The decoder simply couldn't distinguish 5nm-spaced
 output wavelengths with 33nm-resolution encoding.
+
+### BREAKTHROUGH: Total uncertainty = epistemic + aleatoric
+
+predict_with_uncertainty was only reporting z-sample std (epistemic).
+The decoder ALSO outputs per-wavelength log_var (aleatoric) which was
+being computed but THROWN AWAY. Combining both:
+
+  total_var = Var(s_mu across z) + Mean(exp(s_logvar) across z)
+
+Results on iter_highfreq epoch 50 (same model, no retraining):
+
+| Uncertainty | Coverage@400 | Post-hoc T |
+|-------------|-------------|------------|
+| Epistemic only | 10.1%   | 51.8       |
+| **Total**      | **99.3%** | **3.0**  |
+
+The "variance collapse" was the epistemic component collapsing while
+the aleatoric component correctly captured prediction uncertainty.
+The model was well-calibrated all along — we were measuring the wrong
+output.
+
+T=3.0 means total uncertainty is ~3× too wide (slightly underconfident).
+This is trivially fixable with post-hoc T-scaling.
