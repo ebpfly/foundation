@@ -31,6 +31,7 @@ import numpy as np
 import torch
 
 from spectralnp.data.random_sensor import (
+    VirtualSensor,
     add_sensor_noise,
     apply_sensor,
     sample_virtual_sensor,
@@ -68,15 +69,30 @@ def run_convergence(
         atmos=atmos, geometry=geom,
     ).toa_radiance.astype(np.float32)
 
+    # Generate NESTED band positions: the largest band count defines a
+    # superset, and smaller counts are strict subsets. This ensures that
+    # adding more bands only ADDS information — it never moves bands.
+    max_n = max(band_counts)
+    wl_lo, wl_hi = float(dense_wl[0]), float(dense_wl[-1])
+    all_centers = np.linspace(wl_lo, wl_hi, max_n).astype(np.float32)
+    fwhm_val = rng.uniform(5.0, min(20.0, (wl_hi - wl_lo) / max_n * 2))
+    all_fwhm = np.full(max_n, fwhm_val, dtype=np.float32)
+
+    # For each band count N, take the first N positions from a
+    # uniformly-spaced grid that is consistent across N values.
+    # Use every (max_n // N)-th band so spacing stays uniform.
     results = []
     for n in band_counts:
-        # Uniform spacing across the full dense wavelength range — this
-        # isolates "more bands" from "different band positions".
-        sensor = sample_virtual_sensor(
-            rng,
-            n_bands_range=(n, n),
-            wavelength_range=(float(dense_wl[0]), float(dense_wl[-1])),
-            strategy="regular",
+        if n >= max_n:
+            idx = np.arange(max_n)
+        else:
+            idx = np.round(np.linspace(0, max_n - 1, n)).astype(int)
+        centers = all_centers[idx]
+        fwhms = all_fwhm[idx]
+
+        sensor = VirtualSensor(
+            center_wavelength_nm=centers,
+            fwhm_nm=fwhms,
         )
         band_rad = apply_sensor(sensor, dense_wl, truth).astype(np.float32)
         band_rad = add_sensor_noise(
@@ -84,8 +100,8 @@ def run_convergence(
         ).astype(np.float32)
 
         pred = predictor.predict(
-            wavelength_nm=sensor.center_wavelength_nm,
-            fwhm_nm=sensor.fwhm_nm,
+            wavelength_nm=centers,
+            fwhm_nm=fwhms,
             radiance=band_rad,
             query_wavelength_nm=dense_wl,
             n_samples=n_samples,
@@ -94,7 +110,7 @@ def run_convergence(
             "n_bands": n,
             "pred_mean": pred.spectral_mean.astype(np.float32),
             "pred_std": pred.spectral_std.astype(np.float32),
-            "input_wl": sensor.center_wavelength_nm.astype(np.float32),
+            "input_wl": centers,
             "input_rad": band_rad,
         })
 
@@ -284,6 +300,10 @@ def main():
     p.add_argument("--n-samples", type=int, default=32)
     p.add_argument("--snr", type=float, default=200.0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--temperature", type=float, default=None,
+                   help="Apply post-hoc temperature scaling to predicted σ. "
+                        "If 'auto', compute optimal T from z-scores. "
+                        "If a number, use that T directly.")
     p.add_argument("--no-open", action="store_true")
     args = p.parse_args()
 
@@ -324,6 +344,24 @@ def main():
         band_counts=BAND_COUNTS, n_samples=args.n_samples,
         snr=args.snr, seed=args.seed,
     )
+
+    # Optional temperature scaling: multiply predicted σ by T before
+    # computing metrics and plotting. If --temperature auto, compute T
+    # from z-scores. If --temperature <float>, use that value.
+    if args.temperature is not None:
+        if args.temperature == 0:  # sentinel for "auto"
+            all_z = []
+            for r in data["results"]:
+                z = (data["truth"] - r["pred_mean"]) / np.maximum(r["pred_std"], 1e-9)
+                all_z.extend(z.tolist())
+            T = float(np.std(all_z))
+            print(f"Auto temperature: T = {T:.1f}")
+        else:
+            T = args.temperature
+            print(f"Applied temperature: T = {T:.1f}")
+        for r in data["results"]:
+            r["pred_std"] = r["pred_std"] * T
+
     metrics = compute_metrics(data)
 
     # ----- Print verdict -----
