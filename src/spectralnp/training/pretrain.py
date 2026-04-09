@@ -91,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Weight on the calibration regulariser that pulls "
                          "predicted variance toward empirical squared error. "
                          "Set >0 to fix overconfident uncertainty.")
+    p.add_argument("--pca-vae", type=str, default=None,
+                    help="Path to trained PCA-VAE checkpoint (final.pt). "
+                         "When set, 50%% of training samples use novel "
+                         "generated spectra instead of USGS (anti-memorisation).")
     p.add_argument("--no-class-balance", action="store_true",
                     help="Disable class-balanced material loss "
                          "(default: enabled when --abs-lookup is used).")
@@ -271,8 +275,12 @@ def main() -> None:
         n_bands_range=(args.min_bands, args.max_bands),
         lut_path=args.lut_path,
         arts_simulator=arts_sim,
+        pca_vae_path=args.pca_vae,
         seed=args.seed,
     )
+    if args.pca_vae:
+        logger.info(f"PCA-VAE generator loaded from {args.pca_vae} "
+                     "(50% of samples will be novel generated spectra)")
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,

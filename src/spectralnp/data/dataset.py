@@ -82,6 +82,7 @@ class SpectralNPDataset(Dataset):
         n_bands_range: tuple[int, int] = (3, 200),
         lut_path: str | Path | None = None,
         arts_simulator=None,
+        pca_vae_path: str | Path | None = None,
         use_full_rtm: bool = False,
         seed: int = 42,
     ) -> None:
@@ -144,6 +145,26 @@ class SpectralNPDataset(Dataset):
             self._arts_reflectance = np.nan_to_num(self._arts_reflectance, nan=GRAYBODY_FILL)
             self._arts_reflectance = np.clip(self._arts_reflectance, 0.0, 1.0).astype(np.float32)
 
+        # Optional PCA-VAE generator for novel spectra (anti-memorisation).
+        self._pca_vae = None
+        self._pca_vae_wl_lo = 350.0
+        self._pca_vae_wl_hi = 2500.0
+        if pca_vae_path is not None:
+            import torch
+            from spectralnp.model.pca_vae import PCAVAE
+
+            ckpt = torch.load(pca_vae_path, map_location="cpu", weights_only=False)
+            self._pca_vae = PCAVAE(ckpt["config"])
+            for k in ["pca_mean", "pca_components", "pca_singular_values",
+                       "z_mean", "z_cholesky"]:
+                if k in ckpt["model_state_dict"]:
+                    setattr(self._pca_vae, k,
+                            torch.zeros_like(ckpt["model_state_dict"][k]))
+            self._pca_vae.load_state_dict(ckpt["model_state_dict"])
+            self._pca_vae.eval()
+            self._pca_vae_wl_lo = ckpt["config"].wavelength_lo
+            self._pca_vae_wl_hi = ckpt["config"].wavelength_hi
+
     def __len__(self) -> int:
         return self.samples_per_epoch
 
@@ -201,7 +222,23 @@ class SpectralNPDataset(Dataset):
         Without augmentation, the model memorizes the 1748 USGS spectra
         (factor 6.63× on training vs 1.27× on held-out). Augmentation
         forces the model to learn spectral physics, not a lookup table.
+
+        If a PCA-VAE generator is loaded (``self._pca_vae``), 50% of
+        samples are replaced entirely with novel generated spectra.
         """
+        # 50% chance: generate a completely novel spectrum from PCA-VAE
+        if self._pca_vae is not None and self.rng.random() < 0.5:
+            import torch
+            with torch.no_grad():
+                gen = self._pca_vae.generate(n_samples=1).numpy()[0]
+            # Resample from the VAE's native grid to the dense grid.
+            vae_wl = np.linspace(
+                self._pca_vae_wl_lo, self._pca_vae_wl_hi,
+                gen.shape[0],
+            )
+            refl = np.interp(self.dense_wl, vae_wl, gen).astype(np.float32)
+            return np.clip(refl, 0.0, 1.0).astype(np.float32)
+
         refl = reflectance.copy()
 
         # 1. Spectral mixing: blend with another random spectrum (50% chance)
