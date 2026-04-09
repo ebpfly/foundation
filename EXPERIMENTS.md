@@ -425,3 +425,16 @@ Multi-head training also benefits from:
 Beats the radiance-only model (4.01 RMSE, 3.15× factor) while
 maintaining good calibration. Multi-task learning improves both
 accuracy and uncertainty estimation simultaneously.
+
+**Epoch 100 FINAL benchmark (multi-head production model):**
+
+Radiance: R²=0.986-0.987, SAM=3.7°, coverage 91-92% at ENMAP/AVIRIS
+Reflectance: R²=0.78, SAM=9.7° at AVIRIS-NG
+Material: Top-1=26%, needs more training
+
+Convergence test (held-out synthetic spectra):
+  RMSE@400     = 4.21
+  Factor       = 2.79×
+  Coverage@400 = 88.9%
+  Obs trend    = ✓ steady/improving
+  Post-hoc T   = 3.4
