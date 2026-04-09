@@ -162,8 +162,13 @@ class SpectralNPDataset(Dataset):
                             torch.zeros_like(ckpt["model_state_dict"][k]))
             self._pca_vae.load_state_dict(ckpt["model_state_dict"])
             self._pca_vae.eval()
-            self._pca_vae_wl_lo = ckpt["config"].wavelength_lo
-            self._pca_vae_wl_hi = ckpt["config"].wavelength_hi
+            # wavelength grid is stored directly in the checkpoint.
+            vae_wl = ckpt.get("wavelength_nm")
+            if vae_wl is not None:
+                import torch as _t
+                vae_wl = vae_wl if isinstance(vae_wl, np.ndarray) else np.array(vae_wl)
+                self._pca_vae_wl_lo = float(vae_wl[0])
+                self._pca_vae_wl_hi = float(vae_wl[-1])
 
     def __len__(self) -> int:
         return self.samples_per_epoch
