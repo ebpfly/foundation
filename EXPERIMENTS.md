@@ -298,3 +298,26 @@ grid. This should help with observation-point fidelity and fine
 spectral feature reconstruction.
 
 Currently testing `iter_highfreq` with n_frequencies=256.
+
+### `iter_highfreq` — n_frequencies=256 (BEST MODEL)
+
+Increased decoder spectral positional encoding from 64 to 256
+frequencies. Resolves ~4nm vs ~33nm before. Everything else same
+as iter_flatten (z=256, flatten, CRPS, KL=0.01, PCA-VAE augmented).
+
+| Epoch | RMSE@400 | Factor | Obs@400 | Coverage@400 | T   |
+|-------|----------|--------|---------|--------------|-----|
+| 10    | 11.82    | 1.39×  | ---     | 4.7%         | 21  |
+| 20    | 11.10    | ---    | 16.06   | 12.5%        | --- |
+| 30    | ---      | 2.23×  | 9.71    | 3.3%         | --- |
+| 50    | **4.16** |**3.47×**|**4.45**| **10.1%**    | 52  |
+
+**Best model on ALL metrics (held-out):**
+- RMSE@400 = 4.16 (was 5.0 best)
+- Factor = 3.47× on held-out (was 3.93× on training, 2.41× held-out)
+- Obs@400 = 4.45 (was 13-15 — 3× improvement!)
+- Coverage = 10.1% (was 3.5%)
+
+The spectral resolution bottleneck was a bigger factor than z_dim or
+aggregation method. The decoder simply couldn't distinguish 5nm-spaced
+output wavelengths with 33nm-resolution encoding.
