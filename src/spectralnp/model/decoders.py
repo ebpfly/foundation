@@ -46,12 +46,17 @@ class SpectralDecoder(nn.Module):
         n_frequencies: int = 64,
         hidden: int = 512,
         n_layers: int = 4,
+        use_r: bool = True,
     ) -> None:
         super().__init__()
         self.query_enc = SpectralPositionalEncoding(n_frequencies, d_model)
+        self.use_r = use_r
 
         layers: list[nn.Module] = []
-        in_dim = d_model + z_dim + d_model  # r + z + query_encoding
+        # Optionally drop r from the decoder input. Forces the decoder
+        # to depend on the latent z, mitigating posterior collapse where
+        # the deterministic representation r dominates and z is ignored.
+        in_dim = (d_model if use_r else 0) + z_dim + d_model
         for i in range(n_layers):
             out_dim = hidden if i < n_layers - 1 else hidden
             layers.extend([nn.Linear(in_dim if i == 0 else hidden, out_dim), nn.GELU()])
@@ -92,11 +97,13 @@ class SpectralDecoder(nn.Module):
 
         q_enc = self.query_enc(query_wavelength, query_fwhm)  # (B, Q, d_model)
 
-        # Broadcast r and z across query wavelengths.
-        r_exp = r.unsqueeze(1).expand(-1, Q, -1)   # (B, Q, d_model)
+        # Broadcast z (and optionally r) across query wavelengths.
         z_exp = z.unsqueeze(1).expand(-1, Q, -1)   # (B, Q, z_dim)
-
-        inp = torch.cat([r_exp, z_exp, q_enc], dim=-1)  # (B, Q, d_model+z_dim+d_model)
+        if self.use_r:
+            r_exp = r.unsqueeze(1).expand(-1, Q, -1)   # (B, Q, d_model)
+            inp = torch.cat([r_exp, z_exp, q_enc], dim=-1)
+        else:
+            inp = torch.cat([z_exp, q_enc], dim=-1)
         out = self.mlp(inp)  # (B, Q, 2)
         mu = out[..., 0]
         log_var = out[..., 1]

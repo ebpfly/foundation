@@ -37,6 +37,7 @@ class SpectralNPConfig:
     # Decoder settings
     spectral_hidden: int = 512
     spectral_n_layers: int = 4
+    spectral_decoder_use_r: bool = True  # if False, drop r from decoder input (forces use of z)
     n_material_classes: int = 100
     n_atmos_params: int = 4
 
@@ -121,6 +122,7 @@ class SpectralNP(nn.Module):
             n_frequencies=cfg.n_frequencies,
             hidden=cfg.spectral_hidden,
             n_layers=cfg.spectral_n_layers,
+            use_r=cfg.spectral_decoder_use_r,
         )
         # Reflectance head — atmosphere-corrected surface reflectance.
         # Same architecture as the radiance decoder; learns its own weights.
@@ -130,6 +132,7 @@ class SpectralNP(nn.Module):
             n_frequencies=cfg.n_frequencies,
             hidden=cfg.spectral_hidden,
             n_layers=cfg.spectral_n_layers,
+            use_r=cfg.spectral_decoder_use_r,
         )
         self.material_decoder = MaterialDecoder(
             d_model=cfg.d_model,

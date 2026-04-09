@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--z-dim", type=int, default=128)
     p.add_argument("--spectral-hidden", type=int, default=512)
     p.add_argument("--spectral-n-layers", type=int, default=4)
+    p.add_argument("--no-r-in-decoder", action="store_true",
+                    help="Drop the deterministic representation r from the "
+                         "spectral decoder input. Forces the decoder to depend "
+                         "on the latent z, which can mitigate posterior collapse "
+                         "where r dominates and z is ignored.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
@@ -279,6 +284,7 @@ def main() -> None:
         z_dim=args.z_dim,
         spectral_hidden=args.spectral_hidden,
         spectral_n_layers=args.spectral_n_layers,
+        spectral_decoder_use_r=not args.no_r_in_decoder,
         n_material_classes=dataset.n_material_classes,
     )
     model = SpectralNP(cfg).to(device)
