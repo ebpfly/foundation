@@ -22,35 +22,38 @@ def spectral_reconstruction_loss(
     target: Tensor,
     log_var_min: float = -7.0,
     log_var_max: float = 4.0,
-    beta_nll: float = 0.5,
+    use_crps: bool = True,
 ) -> Tensor:
-    """Heteroscedastic Gaussian NLL for spectral reconstruction.
+    """Spectral reconstruction loss.
 
-    Uses **β-NLL** (Seitzer et al., 2022) to prevent variance collapse.
-    Standard NLL has an asymmetric incentive: correct predictions push σ↓
-    (free loss reduction), while wrong predictions push σ↑ (costly).
-    The model learns to set σ at the floor. β-NLL re-weights each sample's
-    loss by ``σ^(2β)`` which dampens the "I'm right, shrink σ" gradient.
+    When ``use_crps=True`` (default), uses the **Gaussian CRPS** (Continuous
+    Ranked Probability Score). This is a proper scoring rule that
+    naturally balances accuracy and calibration — unlike heteroscedastic
+    NLL which collapses variance because minimising the log-var term is
+    "free" for accurate predictions.
 
-    β=0 → standard NLL (variance collapses).
-    β=0.5 → balanced: the gradient on log_var from correct predictions
-             is exactly offset by the gradient from wrong predictions.
-    β=1 → MSE only (ignores variance entirely).
+    When ``use_crps=False``, uses standard heteroscedastic Gaussian NLL.
 
     Stability: ``log_var`` is clamped to ``[log_var_min, log_var_max]``.
     """
     pred_log_var = pred_log_var.clamp(log_var_min, log_var_max)
-    precision = torch.exp(-pred_log_var)
-    nll = 0.5 * (pred_log_var + precision * (target - pred_mu) ** 2)
+    sigma = (0.5 * pred_log_var).exp()  # sqrt(exp(log_var))
 
-    if beta_nll > 0:
-        # β-NLL: weight each sample's loss by detached σ^(2β).
-        # The detach prevents the weighting from introducing bias in the
-        # gradient on the mean — only the variance gradient is rebalanced.
-        weight = torch.exp(beta_nll * pred_log_var.detach())
-        nll = nll * weight
-
-    return nll.mean()
+    if use_crps:
+        # Gaussian CRPS (closed form):
+        # CRPS(y, μ, σ) = σ * [z*(2Φ(z) - 1) + 2φ(z) - 1/√π]
+        # where z = (y - μ) / σ
+        z = (target - pred_mu) / sigma.clamp(min=1e-6)
+        # Φ(z) via torch.special.ndtr or the error function
+        phi_z = 0.5 * (1.0 + torch.erf(z / 1.4142135623730951))  # Φ(z)
+        pdf_z = torch.exp(-0.5 * z ** 2) / 2.5066282746310002     # φ(z)
+        crps = sigma * (z * (2 * phi_z - 1) + 2 * pdf_z - 0.5641895835477563)
+        return crps.mean()
+    else:
+        # Standard heteroscedastic Gaussian NLL.
+        precision = torch.exp(-pred_log_var)
+        nll = 0.5 * (pred_log_var + precision * (target - pred_mu) ** 2)
+        return nll.mean()
 
 
 def np_kl_divergence(
