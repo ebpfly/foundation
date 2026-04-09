@@ -139,6 +139,19 @@ def compute_metrics(data: dict) -> dict:
         for r in results
     ])
 
+    # Observation-point fidelity: RMSE between the predicted radiance AT
+    # the input band wavelengths and the actual input band radiance.
+    # This must NOT degrade as band count increases — if it does, the
+    # encoder is losing per-band information (e.g. mean-pooling dilution).
+    dense_wl = data["dense_wl"]
+    obs_rmse = []
+    for r in results:
+        # Interpolate the dense prediction to the input band positions.
+        pred_at_obs = np.interp(r["input_wl"], dense_wl, r["pred_mean"])
+        err = float(np.sqrt(np.mean((pred_at_obs - r["input_rad"]) ** 2)))
+        obs_rmse.append(err)
+    obs_rmse = np.array(obs_rmse)
+
     # Cross-N similarity: how much do predictions change between band counts?
     all_preds = np.stack([r["pred_mean"] for r in results])
     diversity_per_wl = all_preds.std(axis=0)
@@ -159,6 +172,7 @@ def compute_metrics(data: dict) -> dict:
     return {
         "n_bands": n_band_list,
         "rmse_vs_truth": rmse,
+        "obs_rmse": obs_rmse,
         "sharpness": sharpness,
         "coverage_2sigma": coverage_2sigma,
         "diversity_per_wl": diversity_per_wl,
@@ -378,6 +392,18 @@ def main():
           f"{metrics['rmse_vs_truth'][0] / max(metrics['rmse_vs_truth'][-1], 1e-9):.2f}×")
     print(f"  Sharpness @ {BAND_COUNTS[0]} bands:                     {metrics['sharpness'][0]:.4f}")
     print(f"  Sharpness @ {BAND_COUNTS[-1]} bands:                    {metrics['sharpness'][-1]:.4f}")
+
+    # Observation-point fidelity: does the model reproduce its own inputs?
+    obs_3 = metrics["obs_rmse"][0]
+    obs_400 = metrics["obs_rmse"][-1]
+    obs_trend = "✓ steady/improving" if obs_400 <= obs_3 * 1.2 else "✗ DEGRADING"
+    print(f"  Obs-point RMSE @ {BAND_COUNTS[0]} bands:                {obs_3:.4f}")
+    print(f"  Obs-point RMSE @ {BAND_COUNTS[-1]} bands:               {obs_400:.4f}")
+    print(f"  Obs-point trend:                          {obs_trend}")
+    if obs_400 > obs_3 * 1.5:
+        print(f"  >>> OBSERVATION FIDELITY DEGRADATION <<<")
+        print(f"  Accuracy at input band positions gets WORSE with more bands.")
+        print(f"  Likely cause: encoder aggregation is too lossy (mean-pooling?).")
 
     # Coverage @ 2σ (calibration check)
     cov_3 = metrics["coverage_2sigma"][0]
