@@ -49,6 +49,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--z-dim", type=int, default=128)
     p.add_argument("--spectral-hidden", type=int, default=512)
     p.add_argument("--spectral-n-layers", type=int, default=4)
+    p.add_argument("--no-r-in-decoder", action="store_true",
+                    help="Drop the deterministic representation r from the "
+                         "spectral decoder input. Forces the decoder to depend "
+                         "on the latent z, which can mitigate posterior collapse "
+                         "where r dominates and z is ignored.")
+    p.add_argument("--z-atm-dim", type=int, default=None,
+                    help="Override z_atm_dim (default 32)")
+    p.add_argument("--z-surf-dim", type=int, default=None,
+                    help="Override z_surf_dim (default 96)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
@@ -78,6 +87,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="KL weight (default 0.001 — was 0.01 which caused "
                          "collapse on real ARTS data; lower is safer).")
     p.add_argument("--w-material", type=float, default=0.1)
+    p.add_argument("--w-calibration", type=float, default=0.0,
+                    help="Weight on the calibration regulariser that pulls "
+                         "predicted variance toward empirical squared error. "
+                         "Set >0 to fix overconfident uncertainty.")
+    p.add_argument("--no-class-balance", action="store_true",
+                    help="Disable class-balanced material loss "
+                         "(default: enabled when --abs-lookup is used).")
     p.add_argument("--wl-min-nm", type=float, default=None,
                     help="Min wavelength of the dense reconstruction grid (nm). "
                          "Default: 380 nm (or 300 nm if --abs-lookup is set).")
@@ -91,6 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
     # KL annealing.
     p.add_argument("--kl-warmup-epochs", type=int, default=10,
                     help="Linearly anneal KL weight from 0 to target over this many epochs")
+    p.add_argument("--lr-constant", action="store_true",
+                    help="Use constant LR (no cosine decay) — useful for short iteration runs")
     return p
 
 
@@ -264,14 +282,20 @@ def main() -> None:
     )
 
     # Model.
-    cfg = SpectralNPConfig(
+    cfg_kwargs = dict(
         d_model=args.d_model,
         n_layers=args.n_layers,
         z_dim=args.z_dim,
         spectral_hidden=args.spectral_hidden,
         spectral_n_layers=args.spectral_n_layers,
+        spectral_decoder_use_r=not args.no_r_in_decoder,
         n_material_classes=dataset.n_material_classes,
     )
+    if args.z_atm_dim is not None:
+        cfg_kwargs["z_atm_dim"] = args.z_atm_dim
+    if args.z_surf_dim is not None:
+        cfg_kwargs["z_surf_dim"] = args.z_surf_dim
+    cfg = SpectralNPConfig(**cfg_kwargs)
     model = SpectralNP(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {n_params:,}")
@@ -280,19 +304,40 @@ def main() -> None:
     optimiser = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
+    if args.lr_constant:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_lambda=lambda _: 1.0)
+        logger.info("Using constant LR (no cosine decay).")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
 
     # Loss.
+    # Class-balanced material loss: weights inversely proportional to category size.
+    class_weights = None
+    if not args.no_class_balance:
+        counts = np.bincount(
+            dataset.category_id_by_spec, minlength=dataset.n_material_classes
+        ).astype(np.float64)
+        # Inverse frequency, normalised to mean=1.
+        weights = (counts.sum() / np.maximum(counts, 1)) / dataset.n_material_classes
+        class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+        weights_str = ", ".join(
+            f"{n}={w:.2f}" for n, w in zip(dataset.category_names, weights)
+        )
+        logger.info(f"Class weights: {weights_str}")
+
     loss_fn = SpectralNPLoss(
         w_spectral=args.w_spectral,
         w_reflectance=args.w_reflectance,
         w_atmos=args.w_atmos,
         w_kl=args.w_kl,
         w_material=args.w_material,
-    )
+        w_calibration=args.w_calibration,
+        material_class_weights=class_weights,
+    ).to(device)
     logger.info(
         f"Loss weights: spectral={args.w_spectral} reflectance={args.w_reflectance} "
-        f"atmos={args.w_atmos} kl={args.w_kl} material={args.w_material}"
+        f"atmos={args.w_atmos} kl={args.w_kl} material={args.w_material} "
+        f"calibration={args.w_calibration}"
     )
 
     # Optional W&B.

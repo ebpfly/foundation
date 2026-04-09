@@ -20,23 +20,40 @@ def spectral_reconstruction_loss(
     pred_mu: Tensor,
     pred_log_var: Tensor,
     target: Tensor,
-    log_var_min: float = -10.0,
-    log_var_max: float = 10.0,
+    log_var_min: float = -7.0,
+    log_var_max: float = 4.0,
+    use_crps: bool = True,
 ) -> Tensor:
-    """Heteroscedastic Gaussian NLL for spectral reconstruction.
+    """Spectral reconstruction loss.
 
-    The model predicts both mean and log-variance at each wavelength.
+    When ``use_crps=True`` (default), uses the **Gaussian CRPS** (Continuous
+    Ranked Probability Score). This is a proper scoring rule that
+    naturally balances accuracy and calibration — unlike heteroscedastic
+    NLL which collapses variance because minimising the log-var term is
+    "free" for accurate predictions.
 
-    Stability: ``log_var`` is clamped so that the NLL formula stays
-    bounded. With ``log_var_min=-10`` we cap precision at e^10 ≈ 22000,
-    which prevents the (y-mu)^2 / exp(log_var) term from exploding when
-    the model becomes overconfident on wrong predictions. The clamp is
-    differentiable (straight-through).
+    When ``use_crps=False``, uses standard heteroscedastic Gaussian NLL.
+
+    Stability: ``log_var`` is clamped to ``[log_var_min, log_var_max]``.
     """
     pred_log_var = pred_log_var.clamp(log_var_min, log_var_max)
-    precision = torch.exp(-pred_log_var)
-    nll = 0.5 * (pred_log_var + precision * (target - pred_mu) ** 2)
-    return nll.mean()
+    sigma = (0.5 * pred_log_var).exp()  # sqrt(exp(log_var))
+
+    if use_crps:
+        # Gaussian CRPS (closed form):
+        # CRPS(y, μ, σ) = σ * [z*(2Φ(z) - 1) + 2φ(z) - 1/√π]
+        # where z = (y - μ) / σ
+        z = (target - pred_mu) / sigma.clamp(min=1e-6)
+        # Φ(z) via torch.special.ndtr or the error function
+        phi_z = 0.5 * (1.0 + torch.erf(z / 1.4142135623730951))  # Φ(z)
+        pdf_z = torch.exp(-0.5 * z ** 2) / 2.5066282746310002     # φ(z)
+        crps = sigma * (z * (2 * phi_z - 1) + 2 * pdf_z - 0.5641895835477563)
+        return crps.mean()
+    else:
+        # Standard heteroscedastic Gaussian NLL.
+        precision = torch.exp(-pred_log_var)
+        nll = 0.5 * (pred_log_var + precision * (target - pred_mu) ** 2)
+        return nll.mean()
 
 
 def np_kl_divergence(
@@ -105,9 +122,35 @@ def atmospheric_loss(
     return nll + reg_weight * reg
 
 
-def material_loss(logits: Tensor, target: Tensor) -> Tensor:
-    """Cross-entropy for material classification."""
-    return F.cross_entropy(logits, target)
+def material_loss(
+    logits: Tensor,
+    target: Tensor,
+    class_weights: Tensor | None = None,
+) -> Tensor:
+    """Cross-entropy for material classification, optionally class-weighted.
+
+    USGS categories are highly imbalanced (~880 minerals vs ~11 coatings),
+    so unweighted CE collapses to predicting "minerals" all the time.
+    Pass per-class weights inversely proportional to category frequency.
+    """
+    return F.cross_entropy(logits, target, weight=class_weights)
+
+
+def calibration_loss(pred_mu: Tensor, pred_log_var: Tensor, target: Tensor) -> Tensor:
+    """Calibration regulariser: penalise mismatch between predicted variance
+    and the empirical squared error.
+
+    The standard heteroscedastic NLL has a known failure mode where the
+    optimum drives ``log_var`` toward -∞ for any near-perfect prediction.
+    This regulariser pulls ``log_var`` toward ``log((y-mu)^2)``, i.e. the
+    empirical squared error, which is what a well-calibrated Gaussian
+    should report.
+
+    Returns the mean absolute log-ratio.
+    """
+    sq_err = (target - pred_mu) ** 2 + 1e-8
+    log_sq_err = torch.log(sq_err)
+    return (pred_log_var - log_sq_err).abs().mean()
 
 
 class SpectralNPLoss(torch.nn.Module):
@@ -130,6 +173,8 @@ class SpectralNPLoss(torch.nn.Module):
         w_kl: float = 0.01,
         w_material: float = 0.1,
         w_evidence_reg: float = 0.01,
+        w_calibration: float = 0.0,
+        material_class_weights: Tensor | None = None,
     ) -> None:
         super().__init__()
         self.w_spectral = w_spectral
@@ -138,6 +183,12 @@ class SpectralNPLoss(torch.nn.Module):
         self.w_kl = w_kl
         self.w_material = w_material
         self.w_evidence_reg = w_evidence_reg
+        self.w_calibration = w_calibration
+        # Register so it moves with .to(device).
+        if material_class_weights is not None:
+            self.register_buffer("material_class_weights", material_class_weights)
+        else:
+            self.material_class_weights = None
 
     def forward(
         self,
@@ -160,12 +211,20 @@ class SpectralNPLoss(torch.nn.Module):
             losses["spectral"] = spectral_reconstruction_loss(
                 output.spectral_mu, output.spectral_log_var, target_radiance
             )
+            if self.w_calibration > 0:
+                losses["spectral_calib"] = calibration_loss(
+                    output.spectral_mu, output.spectral_log_var, target_radiance
+                )
 
         # Surface reflectance reconstruction.
         if output.reflectance_mu is not None and target_reflectance is not None:
             losses["reflectance"] = spectral_reconstruction_loss(
                 output.reflectance_mu, output.reflectance_log_var, target_reflectance
             )
+            if self.w_calibration > 0:
+                losses["reflectance_calib"] = calibration_loss(
+                    output.reflectance_mu, output.reflectance_log_var, target_reflectance
+                )
 
         # Atmospheric parameters.
         if output.atmos_gamma is not None:
@@ -187,7 +246,10 @@ class SpectralNPLoss(torch.nn.Module):
 
         # Material classification.
         if self.w_material > 0 and target_material is not None and output.material_logits is not None:
-            losses["material"] = material_loss(output.material_logits, target_material)
+            losses["material"] = material_loss(
+                output.material_logits, target_material,
+                class_weights=self.material_class_weights,
+            )
 
         # Weighted total.
         total = torch.tensor(0.0, device=target_radiance.device)
@@ -195,6 +257,10 @@ class SpectralNPLoss(torch.nn.Module):
             total = total + self.w_spectral * losses["spectral"]
         if "reflectance" in losses:
             total = total + self.w_reflectance * losses["reflectance"]
+        if "spectral_calib" in losses:
+            total = total + self.w_calibration * losses["spectral_calib"]
+        if "reflectance_calib" in losses:
+            total = total + self.w_calibration * losses["reflectance_calib"]
         if "atmos" in losses:
             total = total + self.w_atmos * losses["atmos"]
         if "kl" in losses:
