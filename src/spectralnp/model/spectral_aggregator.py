@@ -179,6 +179,7 @@ class StochasticEncoder(nn.Module):
 
     def __init__(self, d_model: int, z_dim: int, n_heads: int = 4, n_queries: int = 32) -> None:
         super().__init__()
+        self.n_queries = n_queries
         self.pre = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -188,9 +189,11 @@ class StochasticEncoder(nn.Module):
         self.queries = nn.Parameter(torch.randn(n_queries, d_model) * 0.02)
         self.cross_attn = CrossAttention(d_model, n_heads)
         self.norm = nn.LayerNorm(d_model)
-        # Pool attended queries → z parameters.
-        self.to_mu = nn.Linear(d_model, z_dim)
-        self.to_log_sigma = nn.Linear(d_model, z_dim)
+        # Flatten K attended queries and project to z — preserves the
+        # per-query structure instead of destroying it with mean-pool.
+        # K*d_model → z_dim captures much more spectral detail.
+        self.to_mu = nn.Linear(n_queries * d_model, z_dim)
+        self.to_log_sigma = nn.Linear(n_queries * d_model, z_dim)
 
     def forward(self, h: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Return (mu, log_sigma) of q(z | context).
@@ -203,11 +206,11 @@ class StochasticEncoder(nn.Module):
         # Cross-attend: learned queries → band features.
         queries = self.queries.unsqueeze(0).expand(B, -1, -1)  # (B, K, d)
         attended = self.cross_attn(queries, s, mask=mask)       # (B, K, d)
-        # Mean-pool the K attended queries (K is small and fixed, so
-        # this doesn't have the N-dependent dilution problem).
-        pooled = self.norm(attended).mean(dim=1)                # (B, d)
-        mu = self.to_mu(pooled)
-        log_sigma = self.to_log_sigma(pooled)
+        attended = self.norm(attended)
+        # Flatten K×d into a single vector — preserves per-query structure.
+        flat = attended.reshape(B, -1)  # (B, K*d)
+        mu = self.to_mu(flat)
+        log_sigma = self.to_log_sigma(flat)
         # Clamp for numerical stability.
         log_sigma = log_sigma.clamp(-10.0, 2.0)
         return mu, log_sigma
