@@ -416,3 +416,12 @@ Multi-head training also benefits from:
 - Reflectance head provides atmospheric-correction signal
 - Atmospheric head grounds the latent in physical parameters
 - Material head adds classification regularization
+
+**Epoch 70: BEST MODEL on all metrics**
+| Epoch | RMSE@400 | Factor | Coverage@400 | T   |
+|-------|----------|--------|--------------|-----|
+| 70    | **3.36** |**3.55×**| 89.2%       | 3.0 |
+
+Beats the radiance-only model (4.01 RMSE, 3.15× factor) while
+maintaining good calibration. Multi-task learning improves both
+accuracy and uncertainty estimation simultaneously.
