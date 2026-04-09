@@ -348,6 +348,91 @@ def test_sensor_convolution(samples: list[dict], dense_wl: np.ndarray, rep: Repo
     )
 
 
+def test_bandwidth(samples: list[dict], dense_wl: np.ndarray, rep: Report) -> None:
+    """Verify that band FWHM (bandwidth) is meaningful and used correctly.
+
+    1. FWHM varies across samples (different virtual instruments).
+    2. Per-sample FWHM may be uniform (regular sensor) or varying
+       (uniform/clustered) — both modes appear in the dataset.
+    3. The sensor convolution actually uses FWHM: convolving the same
+       dense radiance with narrow vs wide FWHM gives different results.
+    4. Narrower FWHM ⇒ less smoothing ⇒ better preservation of
+       fine spectral features.
+    """
+    from spectralnp.data.random_sensor import VirtualSensor, apply_sensor
+
+    # 1. FWHM mean varies across samples
+    sample_mean_fwhm = np.array([
+        s["fwhm"].numpy().mean() for s in samples
+    ])
+    rep.check(
+        "bandwidth: per-sample mean FWHM varies across samples",
+        sample_mean_fwhm.std() > 1.0,
+        f"std={sample_mean_fwhm.std():.2f} nm, "
+        f"range=[{sample_mean_fwhm.min():.1f}, {sample_mean_fwhm.max():.1f}]",
+    )
+
+    # 2. Within-sample FWHM variation: some sensors have varying FWHM
+    n_uniform_fwhm = sum(
+        1 for s in samples if s["fwhm"].numpy().std() < 1e-3
+    )
+    n_varying_fwhm = len(samples) - n_uniform_fwhm
+    rep.check(
+        "bandwidth: dataset includes both uniform-FWHM and varying-FWHM sensors",
+        n_uniform_fwhm > 0 and n_varying_fwhm > 0,
+        f"{n_uniform_fwhm} uniform, {n_varying_fwhm} varying",
+    )
+
+    # 3. The convolution operator actually uses FWHM. Construct a sharp
+    # absorption-like spectrum and convolve with narrow vs wide FWHM at
+    # the same wavelength positions; outputs must differ.
+    test_wl = dense_wl
+    sharp = np.ones_like(test_wl, dtype=np.float32)
+    band_idx = (test_wl > 1380) & (test_wl < 1420)  # narrow water-vapour-like dip
+    sharp[band_idx] = 0.1
+    centers = np.array([1400.0], dtype=np.float32)
+    narrow = VirtualSensor(
+        center_wavelength_nm=centers, fwhm_nm=np.array([5.0], dtype=np.float32)
+    )
+    wide = VirtualSensor(
+        center_wavelength_nm=centers, fwhm_nm=np.array([100.0], dtype=np.float32)
+    )
+    rad_narrow = apply_sensor(narrow, test_wl, sharp)[0]
+    rad_wide = apply_sensor(wide, test_wl, sharp)[0]
+    rep.check(
+        "bandwidth: narrow FWHM resolves a sharp dip more than wide FWHM",
+        rad_narrow < rad_wide,
+        f"narrow(FWHM=5)={rad_narrow:.3f}, wide(FWHM=100)={rad_wide:.3f}",
+    )
+
+    # 4. Cross-FWHM physics: take a sample's dense target and re-convolve
+    # with a 5x wider FWHM at the same band centres; should give a smoother
+    # response (less variance band-to-band).
+    s0 = samples[0]
+    wl0 = s0["wavelength"].numpy()
+    fwhm0 = s0["fwhm"].numpy()
+    target0 = s0["target_radiance"].numpy()
+    sensor_normal = VirtualSensor(
+        center_wavelength_nm=wl0.astype(np.float32),
+        fwhm_nm=fwhm0.astype(np.float32),
+    )
+    sensor_wide = VirtualSensor(
+        center_wavelength_nm=wl0.astype(np.float32),
+        fwhm_nm=(fwhm0 * 5).clip(max=200).astype(np.float32),
+    )
+    rad_normal = apply_sensor(sensor_normal, dense_wl, target0)
+    rad_wide_full = apply_sensor(sensor_wide, dense_wl, target0)
+    if len(rad_normal) > 5:
+        # std band-to-band is a smoothness proxy.
+        std_normal = float(np.std(np.diff(rad_normal)))
+        std_wide = float(np.std(np.diff(rad_wide_full)))
+        rep.check(
+            "bandwidth: 5× wider FWHM produces a smoother spectrum",
+            std_wide < std_normal,
+            f"std(diff): normal={std_normal:.3f}, 5x_wide={std_wide:.3f}",
+        )
+
+
 def test_target_consistency(
     samples: list[dict],
     dataset,
@@ -545,12 +630,12 @@ def make_visualization(
     ax.grid(alpha=0.3)
 
     ax = axes[1, 2]
-    aods = [s["atmos_params"][0].item() for s in samples]
-    wvs = [s["atmos_params"][1].item() for s in samples]
-    ax.scatter(aods, wvs, s=8, alpha=0.5)
-    ax.set_xlabel("aod_550")
-    ax.set_ylabel("water_vapour")
-    ax.set_title("Atmosphere sample distribution")
+    all_fwhm = np.concatenate([s["fwhm"].numpy() for s in samples])
+    ax.hist(all_fwhm, bins=40, color="#9b59b6", alpha=0.8)
+    ax.set_xlabel("FWHM (nm)")
+    ax.set_ylabel("count")
+    ax.set_title(f"Per-band FWHM distribution\n"
+                 f"({len(all_fwhm)} bands across {len(samples)} samples)")
     ax.grid(alpha=0.3)
 
     # Row 2: per-category overlay (vegetation vs minerals etc.)
@@ -631,6 +716,7 @@ def main():
     test_variation(samples, rep)
     test_physics(samples, dense_wl, rep)
     test_sensor_convolution(samples, dense_wl, rep)
+    test_bandwidth(samples, dense_wl, rep)
     test_target_consistency(samples, ds, dense_wl, rep)
 
     for line in rep.lines:
