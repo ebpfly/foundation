@@ -70,8 +70,13 @@ def run_convergence(
 
     results = []
     for n in band_counts:
+        # Uniform spacing across the full dense wavelength range — this
+        # isolates "more bands" from "different band positions".
         sensor = sample_virtual_sensor(
-            rng, n_bands_range=(n, n),
+            rng,
+            n_bands_range=(n, n),
+            wavelength_range=(float(dense_wl[0]), float(dense_wl[-1])),
+            strategy="regular",
         )
         band_rad = apply_sensor(sensor, dense_wl, truth).astype(np.float32)
         band_rad = add_sensor_noise(
