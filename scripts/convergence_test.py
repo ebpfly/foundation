@@ -226,18 +226,16 @@ def make_plot(
     ax_cov.legend(fontsize=8)
     ax_cov.grid(alpha=0.3)
 
-    # Diversity panel — the collapse detector.
-    ax_div = fig.add_subplot(gs[0, 3])
-    ax_div.plot(dense_wl, metrics["diversity_per_wl"], color="#34495e", linewidth=1.2)
-    ax_div.set_xlabel("wavelength (nm)")
-    ax_div.set_ylabel("std of pred mean across N values")
-    title_color = "#27ae60" if metrics["mean_diversity"] > 0.5 else "#e74c3c"
-    ax_div.set_title(
-        f"Diversity (mean={metrics['mean_diversity']:.3f})\n"
-        f"min→max ΔRMSE={metrics['rmse_min_to_max']:.3f}",
-        color=title_color, fontweight="bold",
-    )
-    ax_div.grid(alpha=0.3)
+    # Observation-point fidelity: can the model reproduce its own inputs?
+    ax_obs = fig.add_subplot(gs[0, 3])
+    obs_color = "#27ae60" if metrics["obs_rmse"][-1] <= metrics["obs_rmse"][0] * 1.2 else "#e74c3c"
+    ax_obs.plot(n_bands, metrics["obs_rmse"], "D-", color=obs_color, linewidth=2)
+    ax_obs.set_xscale("log")
+    ax_obs.set_xlabel("# input bands")
+    ax_obs.set_ylabel("RMSE at input band positions")
+    ax_obs.set_title("Obs fidelity (should stay flat or ↓)", fontweight="bold",
+                     color=obs_color)
+    ax_obs.grid(alpha=0.3)
 
     # ----- Per-N spectral plots -----
     for i, r in enumerate(results):
@@ -327,7 +325,7 @@ def main():
     # ----- Load model -----
     ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
     model = SpectralNP(ckpt["config"])
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
     predictor = SpectralNPPredictor(model)
     print(f"Loaded {args.model} (epoch {ckpt.get('epoch')}, "

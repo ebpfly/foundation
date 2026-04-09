@@ -210,3 +210,43 @@ but doesn't change the underlying spectra.
 2. Proper train/test split: hold out 20% of USGS, test on those
 3. Convergence test must use held-out spectra as primary metric
 4. Possibly: simpler model (fewer decoder parameters)
+
+### `iter_vae` — PCA-VAE augmented training (GENERALIZATION FIX)
+
+50% of training samples are novel spectra from the PCA-VAE generator.
+Combined with mixing/scale/noise augmentation on the USGS 50%.
+
+**Critical result**: memorization gap CLOSES for the first time.
+
+| Epoch | Train factor | **Held-out factor** | Held-out RMSE@400 |
+|-------|-------------|--------------------|--------------------|
+| 10    | 3.56×       | 1.12×              | 11.65              |
+| 30    | 2.36×       | **2.37×**           | 7.33               |
+| 40    | ---         | **2.40×**           | 5.48               |
+
+Training and held-out factors match (~2.4×) — the model genuinely
+generalises. RMSE@400 keeps improving (11.6 → 5.5).
+
+Variance is still ~100× too small (T=133). This remains architectural
+(shared μ/σ output layer) and needs the separate-head fix.
+
+**This is the current best configuration.**
+
+### `iter_z512` — larger latent (z=512) with cross-attention encoder
+
+z_atm=128 + z_surf=384 = 512 total (was 128). Cross-attention stochastic
+encoder (32 queries). d_model=128, n_layers=4.
+
+| Epoch | Held-out RMSE@400 | Factor | Obs-point |
+|-------|-------------------|--------|-----------|
+| 10    | 12.55             | 1.14×  | degrading |
+| 30    | 8.65              | 1.75×  | degrading |
+
+Bigger z did NOT help — actually worse than z=128 (which got 2.37× at
+epoch 30). The encoder can't fill the extra capacity. The bottleneck is
+the ENCODER's ability to extract and compress spectral information, not
+the latent size.
+
+Observation-point fidelity still degrades with more bands regardless
+of z_dim or aggregation method. This is a fundamental limit of the
+current latent-bottleneck architecture.
