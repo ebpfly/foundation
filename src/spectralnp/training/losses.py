@@ -20,8 +20,8 @@ def spectral_reconstruction_loss(
     pred_mu: Tensor,
     pred_log_var: Tensor,
     target: Tensor,
-    log_var_min: float = -10.0,
-    log_var_max: float = 10.0,
+    log_var_min: float = -7.0,
+    log_var_max: float = 4.0,
 ) -> Tensor:
     """Heteroscedastic Gaussian NLL for spectral reconstruction.
 
