@@ -167,16 +167,28 @@ class CrossAttention(nn.Module):
 class StochasticEncoder(nn.Module):
     """Map a variable-length set of band features to a diagonal-Gaussian latent z.
 
-    Uses masked mean-pooling so padding tokens don't contribute.
+    Uses **learned-query cross-attention** to aggregate band features
+    into a fixed-size representation, then projects to (mu, log_sigma).
+
+    Previous implementation used mean-pooling, which destructively
+    averages per-band information as band count grows (accuracy at
+    observation points degraded from 13→30 bands because each band's
+    contribution was diluted by 1/N). Cross-attention lets the model
+    learn WHICH information to extract regardless of N.
     """
 
-    def __init__(self, d_model: int, z_dim: int) -> None:
+    def __init__(self, d_model: int, z_dim: int, n_heads: int = 4, n_queries: int = 32) -> None:
         super().__init__()
         self.pre = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
+        # Learned queries that attend to band features.
+        self.queries = nn.Parameter(torch.randn(n_queries, d_model) * 0.02)
+        self.cross_attn = CrossAttention(d_model, n_heads)
+        self.norm = nn.LayerNorm(d_model)
+        # Pool attended queries → z parameters.
         self.to_mu = nn.Linear(d_model, z_dim)
         self.to_log_sigma = nn.Linear(d_model, z_dim)
 
@@ -187,12 +199,13 @@ class StochasticEncoder(nn.Module):
         mask : (B, N) bool, True = valid
         """
         s = self.pre(h)  # (B, N, d_model)
-        if mask is not None:
-            s = s * mask.unsqueeze(-1).float()
-            counts = mask.sum(dim=1, keepdim=True).clamp(min=1).float()  # (B, 1)
-            pooled = s.sum(dim=1) / counts  # (B, d_model)
-        else:
-            pooled = s.mean(dim=1)
+        B = s.shape[0]
+        # Cross-attend: learned queries → band features.
+        queries = self.queries.unsqueeze(0).expand(B, -1, -1)  # (B, K, d)
+        attended = self.cross_attn(queries, s, mask=mask)       # (B, K, d)
+        # Mean-pool the K attended queries (K is small and fixed, so
+        # this doesn't have the N-dependent dilution problem).
+        pooled = self.norm(attended).mean(dim=1)                # (B, d)
         mu = self.to_mu(pooled)
         log_sigma = self.to_log_sigma(pooled)
         # Clamp for numerical stability.
@@ -251,7 +264,7 @@ class SpectralAggregator(nn.Module):
         )
 
         # Stochastic path: per-pixel surface latent.
-        self.stochastic = StochasticEncoder(d_model, z_dim)
+        self.stochastic = StochasticEncoder(d_model, z_dim, n_heads=n_heads)
 
     def forward(
         self,
