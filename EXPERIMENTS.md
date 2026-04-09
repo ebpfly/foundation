@@ -363,3 +363,18 @@ component dominates and doesn't decrease with band count. But at high
 band counts the model is perfectly calibrated.
 
 **This is the production-ready model for dense-sensor applications.**
+
+**Epoch 100 final:**
+| Epoch | RMSE@400 | Factor | Obs trend | Coverage@400 | T   |
+|-------|----------|--------|-----------|--------------|-----|
+| 50    | 4.32     | 3.17×  | ✗ barely  | 96.2%        | 1.9 |
+| 70    | 4.01     | 3.15×  | ✓ PASS    | 89.4%        | --- |
+| 100   | 5.28     | 2.43×  | ✓ PASS    | **94.6%**    | 2.6 |
+
+Best RMSE at epoch 70 (4.01). Best calibration at epoch 100 (94.6%).
+Obs-point fidelity passes from epoch 70 onwards.
+
+**All three convergence criteria now PASS at epoch 70:**
+1. ✓ RMSE decreases with more bands (factor 3.15×)
+2. ✓ Obs-point fidelity steady/improving
+3. ✓ Coverage@400 within [80%, 99%] (89.4%)
