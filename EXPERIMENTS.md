@@ -272,3 +272,29 @@ and projects directly to z_dim, instead of mean-pooling to d_model
 
 Trade-off: richer intermediate representation gives better calibration
 but harder optimization. Obs-point fidelity still degrades 3→400 bands.
+
+### `iter_flatten_big` — bigger decoder + 100 epochs
+
+d_model=192, n_layers=6, spectral_hidden=384, spectral_n_layers=4.
+
+| Epoch | Held-out RMSE@400 | Factor | Coverage@400 | Obs@3 | Obs@400 |
+|-------|-------------------|--------|--------------|-------|---------|
+| 10    | ---               | 0.98×  | 4.2%         | 2.86  | 18.39   |
+| 20    | 10.25             | 1.72×  | 2.8%         | 2.18  | 16.61   |
+| 30    | 9.59              | 1.65×  | 10.1%        | 0.76  | 13.29   |
+| 50    | 6.47              | 2.51×  | 1.4%         | ---   | ---     |
+
+Coverage peaked at 10.1% (epoch 30) then collapsed to 1.4% (epoch 50).
+Same variance collapse pattern as all models. RMSE kept improving.
+
+### Spectral resolution bottleneck
+
+The decoder's spectral positional encoding has n_frequencies=64.
+Highest frequency resolves ~33nm. Dense grid is 5nm. The decoder
+CAN'T distinguish adjacent output wavelengths.
+
+Increasing to n_frequencies=256 gives ~4nm resolution, matching the
+grid. This should help with observation-point fidelity and fine
+spectral feature reconstruction.
+
+Currently testing `iter_highfreq` with n_frequencies=256.
