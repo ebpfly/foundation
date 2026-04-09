@@ -54,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "spectral decoder input. Forces the decoder to depend "
                          "on the latent z, which can mitigate posterior collapse "
                          "where r dominates and z is ignored.")
+    p.add_argument("--z-atm-dim", type=int, default=None,
+                    help="Override z_atm_dim (default 32)")
+    p.add_argument("--z-surf-dim", type=int, default=None,
+                    help="Override z_surf_dim (default 96)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
@@ -278,7 +282,7 @@ def main() -> None:
     )
 
     # Model.
-    cfg = SpectralNPConfig(
+    cfg_kwargs = dict(
         d_model=args.d_model,
         n_layers=args.n_layers,
         z_dim=args.z_dim,
@@ -287,6 +291,11 @@ def main() -> None:
         spectral_decoder_use_r=not args.no_r_in_decoder,
         n_material_classes=dataset.n_material_classes,
     )
+    if args.z_atm_dim is not None:
+        cfg_kwargs["z_atm_dim"] = args.z_atm_dim
+    if args.z_surf_dim is not None:
+        cfg_kwargs["z_surf_dim"] = args.z_surf_dim
+    cfg = SpectralNPConfig(**cfg_kwargs)
     model = SpectralNP(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {n_params:,}")
