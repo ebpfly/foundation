@@ -149,6 +149,27 @@ class SpectralNP(nn.Module):
             use_r=cfg.spectral_decoder_use_r,
         )
 
+    @classmethod
+    def from_checkpoint(cls, ckpt: dict, device: str = "cpu") -> "SpectralNP":
+        """Load from a checkpoint dict, handling old config compatibility.
+
+        Filters out state dict keys with shape mismatches so that old
+        checkpoints (e.g. with use_r=True for some decoders) can still
+        load for the matching parts.
+        """
+        cfg = ckpt["config"]
+        sd = ckpt["model_state_dict"]
+        model = cls(cfg)
+        # Filter out keys whose shapes don't match (old checkpoint compat).
+        model_sd = model.state_dict()
+        filtered = {}
+        for k, v in sd.items():
+            if k in model_sd and model_sd[k].shape == v.shape:
+                filtered[k] = v
+        model.load_state_dict(filtered, strict=False)
+        model.eval()
+        return model
+
     def _reparameterise(self, mu: Tensor, log_sigma: Tensor) -> Tensor:
         """Sample z via the reparameterisation trick."""
         if self.training:

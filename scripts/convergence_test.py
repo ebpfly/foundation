@@ -324,8 +324,7 @@ def main():
 
     # ----- Load model -----
     ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
-    model = SpectralNP(ckpt["config"])
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model = SpectralNP.from_checkpoint(ckpt)
     model.eval()
     predictor = SpectralNPPredictor(model)
     print(f"Loaded {args.model} (epoch {ckpt.get('epoch')}, "
