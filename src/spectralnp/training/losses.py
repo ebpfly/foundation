@@ -16,6 +16,32 @@ from torch import Tensor
 from spectralnp.model.evidential import evidential_regulariser, nig_nll
 
 
+def _feature_weights(target: Tensor, strength: float = 2.0) -> Tensor:
+    """Compute per-wavelength weights that upweight sharp spectral features.
+
+    Takes the absolute first-difference of the target along the wavelength
+    axis, normalises to [1, 1+strength], so flat regions get weight 1 and
+    the steepest transitions get weight 1+strength.
+
+    Parameters
+    ----------
+    target : (B, Q)
+    strength : how much extra weight the sharpest features get
+
+    Returns
+    -------
+    weights : (B, Q) in [1, 1+strength]
+    """
+    # Absolute gradient along wavelength dimension.
+    grad = torch.abs(target[:, 1:] - target[:, :-1])  # (B, Q-1)
+    # Pad to match Q (replicate last value).
+    grad = torch.cat([grad, grad[:, -1:]], dim=1)  # (B, Q)
+    # Normalise per-sample to [0, 1].
+    g_max = grad.max(dim=1, keepdim=True).values.clamp(min=1e-8)
+    grad_norm = grad / g_max
+    return 1.0 + strength * grad_norm
+
+
 def spectral_reconstruction_loss(
     pred_mu: Tensor,
     pred_log_var: Tensor,
@@ -23,6 +49,7 @@ def spectral_reconstruction_loss(
     log_var_min: float = -7.0,
     log_var_max: float = 4.0,
     use_crps: bool = True,
+    feature_weight_strength: float = 0.0,
 ) -> Tensor:
     """Spectral reconstruction loss.
 
@@ -33,6 +60,10 @@ def spectral_reconstruction_loss(
     "free" for accurate predictions.
 
     When ``use_crps=False``, uses standard heteroscedastic Gaussian NLL.
+
+    When ``feature_weight_strength > 0``, wavelengths with steep spectral
+    gradients (absorption bands, red edges) get upweighted by up to
+    ``1 + feature_weight_strength``.
 
     Stability: ``log_var`` is clamped to ``[log_var_min, log_var_max]``.
     """
@@ -47,13 +78,17 @@ def spectral_reconstruction_loss(
         # Φ(z) via torch.special.ndtr or the error function
         phi_z = 0.5 * (1.0 + torch.erf(z / 1.4142135623730951))  # Φ(z)
         pdf_z = torch.exp(-0.5 * z ** 2) / 2.5066282746310002     # φ(z)
-        crps = sigma * (z * (2 * phi_z - 1) + 2 * pdf_z - 0.5641895835477563)
-        return crps.mean()
+        per_point = sigma * (z * (2 * phi_z - 1) + 2 * pdf_z - 0.5641895835477563)
     else:
         # Standard heteroscedastic Gaussian NLL.
         precision = torch.exp(-pred_log_var)
-        nll = 0.5 * (pred_log_var + precision * (target - pred_mu) ** 2)
-        return nll.mean()
+        per_point = 0.5 * (pred_log_var + precision * (target - pred_mu) ** 2)
+
+    if feature_weight_strength > 0:
+        weights = _feature_weights(target, feature_weight_strength)
+        per_point = per_point * weights
+
+    return per_point.mean()
 
 
 def np_kl_divergence(
@@ -174,6 +209,7 @@ class SpectralNPLoss(torch.nn.Module):
         w_material: float = 0.1,
         w_evidence_reg: float = 0.01,
         w_calibration: float = 0.0,
+        feature_weight_strength: float = 0.0,
         material_class_weights: Tensor | None = None,
     ) -> None:
         super().__init__()
@@ -184,6 +220,7 @@ class SpectralNPLoss(torch.nn.Module):
         self.w_material = w_material
         self.w_evidence_reg = w_evidence_reg
         self.w_calibration = w_calibration
+        self.feature_weight_strength = feature_weight_strength
         # Register so it moves with .to(device).
         if material_class_weights is not None:
             self.register_buffer("material_class_weights", material_class_weights)
@@ -209,7 +246,8 @@ class SpectralNPLoss(torch.nn.Module):
         # Spectral reconstruction (radiance).
         if output.spectral_mu is not None:
             losses["spectral"] = spectral_reconstruction_loss(
-                output.spectral_mu, output.spectral_log_var, target_radiance
+                output.spectral_mu, output.spectral_log_var, target_radiance,
+                feature_weight_strength=self.feature_weight_strength,
             )
             if self.w_calibration > 0:
                 losses["spectral_calib"] = calibration_loss(
@@ -219,7 +257,8 @@ class SpectralNPLoss(torch.nn.Module):
         # Surface reflectance reconstruction.
         if output.reflectance_mu is not None and target_reflectance is not None:
             losses["reflectance"] = spectral_reconstruction_loss(
-                output.reflectance_mu, output.reflectance_log_var, target_reflectance
+                output.reflectance_mu, output.reflectance_log_var, target_reflectance,
+                feature_weight_strength=self.feature_weight_strength,
             )
             if self.w_calibration > 0:
                 losses["reflectance_calib"] = calibration_loss(

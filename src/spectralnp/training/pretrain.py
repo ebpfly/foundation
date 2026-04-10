@@ -95,6 +95,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Weight on the calibration regulariser that pulls "
                          "predicted variance toward empirical squared error. "
                          "Set >0 to fix overconfident uncertainty.")
+    p.add_argument("--feature-weight", type=float, default=0.0,
+                    help="Feature-weighted loss strength. When >0, wavelengths "
+                         "with steep spectral gradients (absorption bands, "
+                         "mineral features) get upweighted by up to 1+this.")
     p.add_argument("--pca-vae", type=str, default=None,
                     help="Path to trained PCA-VAE checkpoint (final.pt). "
                          "When set, 50%% of training samples use novel "
@@ -345,12 +349,13 @@ def main() -> None:
         w_kl=args.w_kl,
         w_material=args.w_material,
         w_calibration=args.w_calibration,
+        feature_weight_strength=args.feature_weight,
         material_class_weights=class_weights,
     ).to(device)
     logger.info(
         f"Loss weights: spectral={args.w_spectral} reflectance={args.w_reflectance} "
         f"atmos={args.w_atmos} kl={args.w_kl} material={args.w_material} "
-        f"calibration={args.w_calibration}"
+        f"calibration={args.w_calibration} feature_weight={args.feature_weight}"
     )
 
     # Optional W&B.
