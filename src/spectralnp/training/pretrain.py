@@ -63,6 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--z-surf-dim", type=int, default=None,
                     help="Override z_surf_dim (default 96)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--resume", type=str, default=None,
+                    help="Path to checkpoint to resume from. Loads model weights "
+                         "and optimizer state. Architecture flags must match.")
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
     p.add_argument("--num-workers", type=int, default=4)
@@ -327,6 +330,18 @@ def main() -> None:
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
 
+    # Resume from checkpoint.
+    start_epoch = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        opt_key = "optimiser_state_dict" if "optimiser_state_dict" in ckpt else "optimizer_state_dict"
+        if opt_key in ckpt:
+            optimiser.load_state_dict(ckpt[opt_key])
+        if "epoch" in ckpt:
+            start_epoch = ckpt["epoch"]
+        logger.info(f"Resumed from {args.resume} (epoch {start_epoch})")
+
     # Loss.
     # Class-balanced material loss: weights inversely proportional to category size.
     class_weights = None
@@ -371,7 +386,7 @@ def main() -> None:
     # Training loop.
     best_loss = float("inf")
     arts_rng = np.random.default_rng(args.seed + 10000) if arts_sim is not None else None
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # Refresh ARTS scene cache once per epoch (scene-based fast path).
         if arts_sim is not None:
             import time as _t
