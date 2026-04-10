@@ -389,6 +389,12 @@ def main() -> None:
         wandb.init(project="spectralnp", config=vars(args))
         wandb.watch(model, log_freq=100)
 
+    # TensorBoard logging.
+    from torch.utils.tensorboard import SummaryWriter
+    tb_dir = Path(args.output_dir) / "tb"
+    tb_writer = SummaryWriter(log_dir=str(tb_dir))
+    logger.info(f"TensorBoard: tensorboard --logdir {tb_dir}")
+
     # Output directory.
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -434,6 +440,13 @@ def main() -> None:
             import wandb
             wandb.log({"epoch": epoch + 1, "lr": lr, **metrics})
 
+        # TensorBoard.
+        tb_writer.add_scalar("loss/total", metrics["total"], epoch + 1)
+        for key in ("spectral", "reflectance", "atmos", "kl", "material"):
+            if key in metrics:
+                tb_writer.add_scalar(f"loss/{key}", metrics[key], epoch + 1)
+        tb_writer.add_scalar("lr", lr, epoch + 1)
+
         # Save checkpoint.
         if metrics["total"] < best_loss:
             best_loss = metrics["total"]
@@ -457,6 +470,7 @@ def main() -> None:
                 "category_names": dataset.category_names,
             }, out_dir / f"epoch_{epoch+1}.pt")
 
+    tb_writer.close()
     logger.info(f"Training complete. Best loss: {best_loss:.4f}")
 
 
