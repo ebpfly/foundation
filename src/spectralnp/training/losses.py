@@ -16,17 +16,20 @@ from torch import Tensor
 from spectralnp.model.evidential import evidential_regulariser, nig_nll
 
 
-def _feature_weights(target: Tensor, strength: float = 2.0) -> Tensor:
+def _feature_weights(target: Tensor, strength: float = 2.0, blur_radius: int = 5) -> Tensor:
     """Compute per-wavelength weights that upweight sharp spectral features.
 
     Takes the absolute first-difference of the target along the wavelength
-    axis, normalises to [1, 1+strength], so flat regions get weight 1 and
-    the steepest transitions get weight 1+strength.
+    axis, applies a small box blur to spread the weight around absorption
+    features (not just the single transition pixel), then normalises to
+    [1, 1+strength].
 
     Parameters
     ----------
     target : (B, Q)
     strength : how much extra weight the sharpest features get
+    blur_radius : half-width of the box blur kernel (spreads weight
+        around each transition)
 
     Returns
     -------
@@ -36,6 +39,15 @@ def _feature_weights(target: Tensor, strength: float = 2.0) -> Tensor:
     grad = torch.abs(target[:, 1:] - target[:, :-1])  # (B, Q-1)
     # Pad to match Q (replicate last value).
     grad = torch.cat([grad, grad[:, -1:]], dim=1)  # (B, Q)
+    # Box blur to spread weight around features — a sharp absorption
+    # band affects not just the 1-pixel transition but nearby wavelengths.
+    if blur_radius > 0 and grad.shape[1] > 2 * blur_radius + 1:
+        kernel_size = 2 * blur_radius + 1
+        kernel = torch.ones(1, 1, kernel_size, device=grad.device, dtype=grad.dtype) / kernel_size
+        grad_blurred = F.conv1d(
+            grad.unsqueeze(1), kernel, padding=blur_radius
+        ).squeeze(1)
+        grad = torch.max(grad, grad_blurred)  # keep sharp peaks, add spread
     # Normalise per-sample to [0, 1].
     g_max = grad.max(dim=1, keepdim=True).values.clamp(min=1e-8)
     grad_norm = grad / g_max
