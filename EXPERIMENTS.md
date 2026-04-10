@@ -525,3 +525,16 @@ faster. Sharpness ratio still inverted — uncertainty not scaling correctly.
 ### `iter_grid100` — Grid decoder 100 epochs
 
 Same as iter_grid50 but 100 epochs to see where it plateaus.
+
+| Epoch | RMSE@400 | Factor | Sharp ratio |
+|-------|----------|--------|-------------|
+| 50    | 4.01     | 3.13×  | 0.91×       |
+| 100   | **3.12** | **4.84×** | 0.83×    |
+
+**Best RMSE and factor ever** — surpasses MLP decoder (3.40, 4.36×) in half
+the epochs. Grid decoder is the new default architecture.
+
+Remaining issue: sharpness ratio <1 means uncertainty doesn't shrink enough
+with more input bands. The aleatoric log_var output isn't learning to be
+band-count-aware (it's a per-grid-point output with no direct input about
+how many bands were observed).
