@@ -128,10 +128,13 @@ class MaterialDecoder(nn.Module):
         z_dim: int = 128,
         n_classes: int = 100,
         hidden: int = 256,
+        use_r: bool = True,
     ) -> None:
         super().__init__()
+        self.use_r = use_r
+        in_dim = (d_model if use_r else 0) + z_dim
         self.mlp = nn.Sequential(
-            nn.Linear(d_model + z_dim, hidden),
+            nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.GELU(),
@@ -140,7 +143,9 @@ class MaterialDecoder(nn.Module):
 
     def forward(self, r: Tensor, z: Tensor) -> Tensor:
         """Return logits (B, n_classes)."""
-        return self.mlp(torch.cat([r, z], dim=-1))
+        if self.use_r:
+            return self.mlp(torch.cat([r, z], dim=-1))
+        return self.mlp(z)
 
 
 class AtmosphericDecoder(nn.Module):
@@ -167,10 +172,13 @@ class AtmosphericDecoder(nn.Module):
         z_dim: int = 128,
         n_params: int = 4,
         hidden: int = 256,
+        use_r: bool = True,
     ) -> None:
         super().__init__()
+        self.use_r = use_r
+        in_dim = (d_model if use_r else 0) + z_dim
         self.backbone = nn.Sequential(
-            nn.Linear(d_model + z_dim, hidden),
+            nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.GELU(),
@@ -181,5 +189,6 @@ class AtmosphericDecoder(nn.Module):
         self, r: Tensor, z: Tensor
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Return NIG parameters (gamma, nu, alpha, beta) each (B, n_params)."""
-        feat = self.backbone(torch.cat([r, z], dim=-1))
+        inp = torch.cat([r, z], dim=-1) if self.use_r else z
+        feat = self.backbone(inp)
         return self.nig_head(feat)

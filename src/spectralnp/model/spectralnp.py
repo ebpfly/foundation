@@ -138,6 +138,7 @@ class SpectralNP(nn.Module):
             d_model=cfg.d_model,
             z_dim=z_total,
             n_classes=cfg.n_material_classes,
+            use_r=cfg.spectral_decoder_use_r,
         )
         # Atmospheric decoder uses z_atm only — the atmosphere is shared,
         # it should not depend on per-pixel surface properties.
@@ -145,6 +146,7 @@ class SpectralNP(nn.Module):
             d_model=cfg.d_model,
             z_dim=cfg.z_atm_dim,
             n_params=cfg.n_atmos_params,
+            use_r=cfg.spectral_decoder_use_r,
         )
 
     def _reparameterise(self, mu: Tensor, log_sigma: Tensor) -> Tensor:
