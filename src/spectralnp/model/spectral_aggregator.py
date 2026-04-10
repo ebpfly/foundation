@@ -210,8 +210,10 @@ class StochasticEncoder(nn.Module):
         flat = attended.reshape(B, -1)  # (B, K*d)
         mu = self.to_mu(flat)
         log_sigma = self.to_log_sigma(flat)
-        # Clamp for numerical stability.
-        log_sigma = log_sigma.clamp(-10.0, 2.0)
+        # Clamp log_sigma. The floor prevents posterior collapse — if too
+        # low, z becomes deterministic and epistemic uncertainty vanishes.
+        # -2 → sigma ≈ 0.14, enough variance for meaningful z-sampling.
+        log_sigma = log_sigma.clamp(-2.0, 2.0)
         return mu, log_sigma
 
 
@@ -383,5 +385,5 @@ class CrossPixelAggregator(nn.Module):
         attended = self.cross_attn(queries, pixel_reps, mask=pixel_mask)
         pooled = self.norm(attended).mean(dim=1)  # (B, d_model)
         mu = self.to_mu(pooled)
-        log_sigma = self.to_log_sigma(pooled).clamp(-10.0, 2.0)
+        log_sigma = self.to_log_sigma(pooled).clamp(-2.0, 2.0)
         return mu, log_sigma
