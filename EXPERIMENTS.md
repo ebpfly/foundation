@@ -450,3 +450,16 @@ Coverage jumps from 2-3% to 63-79% without retraining.
 | Sentinel-2 | 0.62  | 12.6° | 1.8%        | **68%**         |
 | ENMAP      | 0.78  | 9.7°  | 2.8%        | **79%**         |
 | AVIRIS-NG  | 0.78  | 9.7°  | 2.7%        | **79%**         |
+
+### `iter_full200` — 200 epochs, w_material=0.2
+
+Same as iter_full but 200 epochs and higher material weight.
+
+| Epoch | RMSE@400 | Factor | Coverage@400 | Obs@400 |
+|-------|----------|--------|--------------|---------|
+| 30    | 7.98     | 1.36×  | 93.9%        | 11.00   |
+| 40    | 5.33     | 2.79×  | 92.5%        | 7.49    |
+| 70    | 4.38     | 3.30×  | **98.1%**    | 4.56    |
+| 100   | **3.96** | 2.88×  | 86.4%        | **3.82**|
+
+Still training. Coverage peaked at 98.1% (epoch 70), RMSE still improving.
