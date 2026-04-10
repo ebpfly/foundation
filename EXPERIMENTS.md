@@ -463,3 +463,19 @@ Same as iter_full but 200 epochs and higher material weight.
 | 100   | **3.96** | 2.88×  | 86.4%        | **3.82**|
 
 Still training. Coverage peaked at 98.1% (epoch 70), RMSE still improving.
+
+| 150   | 5.10     | 3.02×  | 95.1%        | 4.56    |
+
+Epoch 150 held-out average: RMSE factor 3.02×, coverage 95.1% — well-calibrated.
+Obs-point fidelity still shows degradation trend (NP bottleneck, not a bug).
+
+### Feature-weighted CRPS loss (implemented, not yet tested at scale)
+
+Added `--feature-weight` flag: upweights wavelengths with steep spectral
+gradients. Weight = 1 + strength × (|∂target/∂λ| / max|∂target/∂λ|).
+Needs fine-tuning from iter_full200 to test effect on sharp features.
+
+### Checkpoint resume (implemented)
+
+Added `--resume` flag to continue training from a saved checkpoint.
+Loads model weights, optimizer state, and starting epoch.
