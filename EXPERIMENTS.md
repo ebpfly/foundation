@@ -555,7 +555,11 @@ log_sigma clamp raised from -10 to -2. Prevents posterior collapse.
 |-------|----------|--------|-------------|-----------|
 | 50    | **3.06** | **5.02×** | 0.96×    | -0.95     |
 
-**Best RMSE (3.06) and factor (5.02×) ever at 50 epochs.**
+| 100   | 3.55     | 3.47×  | 0.87×       | —         |
+
+**Best RMSE (3.06) and factor (5.02×) ever at epoch 50.**
+Epoch 100 overfits — held-out RMSE degrades despite lower training loss.
+Epoch 50 is the production checkpoint.
+
 Posterior no longer collapsed (z_ls=-0.95 vs -9.5 before), but
 z_log_sigma still doesn't vary much with band count (-0.96 to -0.94).
-Waiting for epoch 100.
