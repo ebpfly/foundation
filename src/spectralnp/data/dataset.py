@@ -79,7 +79,7 @@ class SpectralNPDataset(Dataset):
         spectral_library: SpectralLibrary,
         dense_wavelength_nm: np.ndarray | None = None,
         samples_per_epoch: int = 100_000,
-        n_bands_range: tuple[int, int] = (3, 200),
+        n_bands_range: tuple[int, int] = (3, 425),
         lut_path: str | Path | None = None,
         arts_simulator=None,
         pca_vae_path: str | Path | None = None,
