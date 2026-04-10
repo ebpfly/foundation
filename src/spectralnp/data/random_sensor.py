@@ -31,7 +31,7 @@ def sample_virtual_sensor(
     rng: np.random.Generator,
     n_bands_range: tuple[int, int] = (3, 200),
     wavelength_range: tuple[float, float] = (380.0, 2500.0),
-    fwhm_range: tuple[float, float] = (5.0, 100.0),
+    fwhm_range: tuple[float, float] = (1.0, 100.0),
     strategy: str = "mixed",
 ) -> VirtualSensor:
     """Generate a random virtual sensor configuration.
