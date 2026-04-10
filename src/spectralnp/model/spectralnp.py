@@ -15,7 +15,7 @@ from torch import Tensor
 
 from spectralnp.model.band_encoder import BandEncoder
 from spectralnp.model.spectral_aggregator import CrossPixelAggregator, SpectralAggregator
-from spectralnp.model.decoders import AtmosphericDecoder, MaterialDecoder, SpectralDecoder
+from spectralnp.model.decoders import AtmosphericDecoder, GridDecoder, MaterialDecoder, SpectralDecoder
 
 
 @dataclass
@@ -38,6 +38,10 @@ class SpectralNPConfig:
     spectral_hidden: int = 512
     spectral_n_layers: int = 4
     spectral_decoder_use_r: bool = True  # if False, drop r from decoder input (forces use of z)
+    use_grid_decoder: bool = False  # if True, use fixed-grid 1D conv decoder instead of per-point MLP
+    grid_n_points: int = 425  # number of output wavelengths for grid decoder
+    grid_hidden_channels: int = 128
+    grid_n_blocks: int = 4
     n_material_classes: int = 100
     n_atmos_params: int = 4
 
@@ -115,25 +119,38 @@ class SpectralNP(nn.Module):
         )
 
         # Decoders consume z = cat(z_atm, z_surf).
-        # Radiance head — at-sensor TOA radiance.
-        self.spectral_decoder = SpectralDecoder(
-            d_model=cfg.d_model,
-            z_dim=z_total,
-            n_frequencies=cfg.n_frequencies,
-            hidden=cfg.spectral_hidden,
-            n_layers=cfg.spectral_n_layers,
-            use_r=cfg.spectral_decoder_use_r,
-        )
-        # Reflectance head — atmosphere-corrected surface reflectance.
-        # Same architecture as the radiance decoder; learns its own weights.
-        self.reflectance_decoder = SpectralDecoder(
-            d_model=cfg.d_model,
-            z_dim=z_total,
-            n_frequencies=cfg.n_frequencies,
-            hidden=cfg.spectral_hidden,
-            n_layers=cfg.spectral_n_layers,
-            use_r=cfg.spectral_decoder_use_r,
-        )
+        if cfg.use_grid_decoder:
+            # Fixed-grid 1D conv decoder — decodes full spectrum in one shot.
+            self.spectral_decoder = GridDecoder(
+                z_dim=z_total,
+                n_grid=cfg.grid_n_points,
+                hidden_channels=cfg.grid_hidden_channels,
+                n_blocks=cfg.grid_n_blocks,
+            )
+            self.reflectance_decoder = GridDecoder(
+                z_dim=z_total,
+                n_grid=cfg.grid_n_points,
+                hidden_channels=cfg.grid_hidden_channels,
+                n_blocks=cfg.grid_n_blocks,
+            )
+        else:
+            # Per-point MLP decoder (DeepONet-style, arbitrary queries).
+            self.spectral_decoder = SpectralDecoder(
+                d_model=cfg.d_model,
+                z_dim=z_total,
+                n_frequencies=cfg.n_frequencies,
+                hidden=cfg.spectral_hidden,
+                n_layers=cfg.spectral_n_layers,
+                use_r=cfg.spectral_decoder_use_r,
+            )
+            self.reflectance_decoder = SpectralDecoder(
+                d_model=cfg.d_model,
+                z_dim=z_total,
+                n_frequencies=cfg.n_frequencies,
+                hidden=cfg.spectral_hidden,
+                n_layers=cfg.spectral_n_layers,
+                use_r=cfg.spectral_decoder_use_r,
+            )
         self.material_decoder = MaterialDecoder(
             d_model=cfg.d_model,
             z_dim=z_total,

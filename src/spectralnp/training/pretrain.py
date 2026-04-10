@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "spectral decoder input. Forces the decoder to depend "
                          "on the latent z, which can mitigate posterior collapse "
                          "where r dominates and z is ignored.")
+    p.add_argument("--grid-decoder", action="store_true",
+                    help="Use fixed-grid 1D conv decoder instead of per-point "
+                         "MLP. Decodes full spectrum in one shot; adjacent "
+                         "wavelengths share info through conv kernels.")
+    p.add_argument("--grid-hidden-channels", type=int, default=128)
+    p.add_argument("--grid-n-blocks", type=int, default=4)
     p.add_argument("--z-atm-dim", type=int, default=None,
                     help="Override z_atm_dim (default 32)")
     p.add_argument("--z-surf-dim", type=int, default=None,
@@ -309,6 +315,10 @@ def main() -> None:
         spectral_hidden=args.spectral_hidden,
         spectral_n_layers=args.spectral_n_layers,
         spectral_decoder_use_r=not args.no_r_in_decoder,
+        use_grid_decoder=args.grid_decoder,
+        grid_n_points=args.dense_n_points,
+        grid_hidden_channels=args.grid_hidden_channels,
+        grid_n_blocks=args.grid_n_blocks,
         n_material_classes=dataset.n_material_classes,
     )
     if args.z_atm_dim is not None:

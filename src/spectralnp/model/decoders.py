@@ -110,6 +110,105 @@ class SpectralDecoder(nn.Module):
         return mu, log_var
 
 
+class GridDecoder(nn.Module):
+    """Decode latent z to a fixed wavelength grid via 1D conv stack.
+
+    Unlike SpectralDecoder which decodes each query wavelength independently,
+    this produces the full spectrum in one shot.  Adjacent wavelengths share
+    information through convolutional kernels, enabling better reconstruction
+    of sharp spectral features (absorption bands, red edges).
+
+    Output is (mu, log_var) at each grid point for heteroscedastic uncertainty.
+
+    Parameters
+    ----------
+    z_dim : int
+        Dimension of the stochastic latent z.
+    n_grid : int
+        Number of output wavelength grid points.
+    hidden_channels : int
+        Channel width in the conv stack.
+    n_blocks : int
+        Number of residual conv blocks.
+    """
+
+    def __init__(
+        self,
+        z_dim: int = 256,
+        n_grid: int = 425,
+        hidden_channels: int = 128,
+        n_blocks: int = 4,
+    ) -> None:
+        super().__init__()
+        self.n_grid = n_grid
+
+        # Project z to a spatial feature map: (B, z_dim) → (B, C, L_init)
+        # Start with a small spatial dimension and upsample.
+        self.l_init = max(n_grid // 8, 16)
+        self.proj = nn.Linear(z_dim, hidden_channels * self.l_init)
+
+        # Residual 1D conv blocks with increasing resolution.
+        blocks: list[nn.Module] = []
+        for _ in range(n_blocks):
+            blocks.append(_ResConvBlock(hidden_channels))
+        self.blocks = nn.Sequential(*blocks)
+
+        # Upsample to target grid size, then final projection.
+        self.upsample = nn.Upsample(size=n_grid, mode="linear", align_corners=False)
+        # Output: 2 channels (mu, log_var) per grid point.
+        self.head = nn.Sequential(
+            nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(hidden_channels, 2, kernel_size=1),
+        )
+
+    def forward(
+        self,
+        r: Tensor,
+        z: Tensor,
+        query_wavelength: Tensor | None = None,
+        query_fwhm: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Decode z to the fixed grid.
+
+        Parameters
+        ----------
+        r : Tensor[B, d_model]
+            Ignored (kept for API compatibility).
+        z : Tensor[B, z_dim]
+        query_wavelength, query_fwhm : ignored (grid is fixed).
+
+        Returns
+        -------
+        mu : Tensor[B, n_grid]
+        log_var : Tensor[B, n_grid]
+        """
+        B = z.shape[0]
+        h = self.proj(z).reshape(B, -1, self.l_init)  # (B, C, L_init)
+        h = self.blocks(h)
+        h = self.upsample(h)  # (B, C, n_grid)
+        out = self.head(h)    # (B, 2, n_grid)
+        mu = out[:, 0, :]      # (B, n_grid)
+        log_var = out[:, 1, :] # (B, n_grid)
+        return mu, log_var
+
+
+class _ResConvBlock(nn.Module):
+    """Residual 1D conv block: conv → GELU → conv + skip."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=5, padding=2),
+        )
+        self.norm = nn.GroupNorm(8, channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.norm(x + self.net(x))
+
+
 class MaterialDecoder(nn.Module):
     """Classify surface material from spectral representation.
 
