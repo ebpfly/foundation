@@ -496,3 +496,17 @@ Two changes from iter_full200:
    up to 3× weight, with blur spread around absorption features.
 
 Training 100 epochs from scratch. Architecture otherwise identical to iter_full200.
+
+| Epoch | RMSE@400 | Factor | Coverage@400 |
+|-------|----------|--------|--------------|
+| 20    | 10.79    | 1.42×  | 64.7%        |
+
+### `iter_grid50` — GridDecoder (1D conv) experiment
+
+Same as iter_no_r_feat but replaces the per-point MLP spectral decoder with
+a fixed-grid 1D convolutional decoder. Adjacent wavelengths share information
+through conv kernels (kernel_size=5, 4 residual blocks, 128 channels).
+Hypothesis: conv decoder should reconstruct sharp spectral features better
+because it has spatial awareness.
+
+Training 50 epochs. 5-epoch smoke test showed factor 1.66× (promising).
