@@ -563,3 +563,20 @@ Epoch 50 is the production checkpoint.
 
 Posterior no longer collapsed (z_ls=-0.95 vs -9.5 before), but
 z_log_sigma still doesn't vary much with band count (-0.96 to -0.94).
+
+### `iter_grid_drop` — Grid decoder + dropout + cosine LR
+
+Added 10% dropout to GridDecoder (z projection + conv blocks) and
+switched from constant LR to cosine annealing. Fixes overfitting.
+
+| Epoch | RMSE@400 | Factor | Sharp ratio |
+|-------|----------|--------|-------------|
+| 50    | 4.70     | 3.13×  | 0.81×       |
+| 100   | **3.19** | **4.94×** | 0.75×    |
+
+Epoch 100 **improved** over epoch 50 — no overfitting! (Compare:
+no-dropout run degraded from 3.06→3.55 over the same interval.)
+
+### `iter_grid_drop200` — Same as above, 200 epochs
+
+Longer run to see if RMSE breaks below 3.0.
