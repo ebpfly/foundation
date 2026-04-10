@@ -535,6 +535,14 @@ Same as iter_grid50 but 100 epochs to see where it plateaus.
 the epochs. Grid decoder is the new default architecture.
 
 Remaining issue: sharpness ratio <1 means uncertainty doesn't shrink enough
-with more input bands. The aleatoric log_var output isn't learning to be
-band-count-aware (it's a per-grid-point output with no direct input about
-how many bands were observed).
+with more input bands.
+
+**Root cause diagnosis**: posterior collapse. `z_log_sigma = -6` for ALL band
+counts (5, 50, 200). Aleatoric std dominates (5.1), epistemic from z-sampling
+is zero. The NP latent collapsed to a point estimate. KL weight 0.01 is too
+weak to prevent this.
+
+### `iter_grid_kl` — Grid decoder + higher KL weight (0.1)
+
+Same as iter_grid100 but `w_kl=0.1` (10× higher). Forces the latent to
+maintain meaningful variance so epistemic uncertainty can track band count.
