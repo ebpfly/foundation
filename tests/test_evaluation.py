@@ -31,7 +31,7 @@ from spectralnp.data.rtm_simulator import (
 from spectralnp.data.sensor_definitions import AVIRIS_NG, LANDSAT8_OLI, SENTINEL2_MSI
 from spectralnp.data.synthetic_speclib import generate_synthetic_library
 from spectralnp.inference.predict import SpectralNPPredictor
-from spectralnp.model.spectralnp import SpectralNP, SpectralNPConfig
+from spectralnp.model.spectralnp import SpectralNP
 
 MODEL_PATH = Path(__file__).parent.parent / "demo_model.pt"
 WL_DENSE = np.arange(380.0, 2501.0, 5.0)

@@ -4,17 +4,15 @@ import numpy as np
 import pytest
 
 from spectralnp.data.random_sensor import (
-    VirtualSensor,
     add_sensor_noise,
     apply_sensor,
     sample_virtual_sensor,
 )
 from spectralnp.data.rtm_simulator import (
     AtmosphericState,
-    ViewGeometry,
     simplified_toa_radiance,
 )
-from spectralnp.data.sensor_definitions import LANDSAT8_OLI, SENTINEL2_MSI, SENSORS
+from spectralnp.data.sensor_definitions import LANDSAT8_OLI
 
 
 @pytest.fixture

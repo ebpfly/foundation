@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch import Tensor
 
 from spectralnp.model.spectralnp import SpectralNP, SpectralNPConfig
 

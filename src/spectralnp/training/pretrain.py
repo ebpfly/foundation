@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from spectralnp.data.dataset import SpectralNPDataset, collate_spectral_batch
-from spectralnp.data.usgs_speclib import SpectralLibrary, load_from_directory, load_from_zip
+from spectralnp.data.usgs_speclib import load_from_directory, load_from_zip
 from spectralnp.model.spectralnp import SpectralNP, SpectralNPConfig
 from spectralnp.training.losses import SpectralNPLoss
 

@@ -75,8 +75,6 @@ def test_uncertainty_increases_with_fewer_bands(model):
     # Same underlying "spectrum" observed through different band counts.
     few_bands = 3
     many_bands = 100
-    q_wl = torch.linspace(400, 2400, 200).unsqueeze(0)
-
     # Few bands.
     wl_few = torch.linspace(500, 2000, few_bands).unsqueeze(0)
     fwhm_few = torch.full((1, few_bands), 50.0)
