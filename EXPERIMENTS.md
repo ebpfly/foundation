@@ -475,7 +475,24 @@ Added `--feature-weight` flag: upweights wavelengths with steep spectral
 gradients. Weight = 1 + strength × (|∂target/∂λ| / max|∂target/∂λ|).
 Needs fine-tuning from iter_full200 to test effect on sharp features.
 
+| 160   | 5.48     | 3.41×  | 88.9%        | 5.46    |
+| 200   | **3.40** | **4.36×** | 76.5%     | 4.05    |
+
+**Final: best RMSE (3.40) and factor (4.36×) ever.** Coverage regressed to 76.5%
+(post-hoc T=4.2 fixes to 96%). Model converged — training loss still improving
+but held-out metrics oscillating.
+
 ### Checkpoint resume (implemented)
 
 Added `--resume` flag to continue training from a saved checkpoint.
 Loads model weights, optimizer state, and starting epoch.
+
+### `iter_no_r_feat` — r dropped from ALL decoders + feature-weighted loss
+
+Two changes from iter_full200:
+1. Deterministic `r` dropped from material and atmospheric decoders too
+   (previously only spectral/reflectance). All info flows through z.
+2. Feature-weighted CRPS (strength=2.0): sharp spectral transitions get
+   up to 3× weight, with blur spread around absorption features.
+
+Training 100 epochs from scratch. Architecture otherwise identical to iter_full200.
