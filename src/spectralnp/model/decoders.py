@@ -138,6 +138,7 @@ class GridDecoder(nn.Module):
         n_grid: int = 425,
         hidden_channels: int = 128,
         n_blocks: int = 4,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.n_grid = n_grid
@@ -146,11 +147,12 @@ class GridDecoder(nn.Module):
         # Start with a small spatial dimension and upsample.
         self.l_init = max(n_grid // 8, 16)
         self.proj = nn.Linear(z_dim, hidden_channels * self.l_init)
+        self.z_drop = nn.Dropout(dropout)
 
         # Residual 1D conv blocks with increasing resolution.
         blocks: list[nn.Module] = []
         for _ in range(n_blocks):
-            blocks.append(_ResConvBlock(hidden_channels))
+            blocks.append(_ResConvBlock(hidden_channels, dropout))
         self.blocks = nn.Sequential(*blocks)
 
         # Upsample to target grid size, then final projection.
@@ -184,7 +186,7 @@ class GridDecoder(nn.Module):
         log_var : Tensor[B, n_grid]
         """
         B = z.shape[0]
-        h = self.proj(z).reshape(B, -1, self.l_init)  # (B, C, L_init)
+        h = self.z_drop(self.proj(z)).reshape(B, -1, self.l_init)  # (B, C, L_init)
         h = self.blocks(h)
         h = self.upsample(h)  # (B, C, n_grid)
         out = self.head(h)    # (B, 2, n_grid)
@@ -194,13 +196,14 @@ class GridDecoder(nn.Module):
 
 
 class _ResConvBlock(nn.Module):
-    """Residual 1D conv block: conv → GELU → conv + skip."""
+    """Residual 1D conv block: conv → GELU → dropout → conv + skip."""
 
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, dropout: float = 0.0) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv1d(channels, channels, kernel_size=5, padding=2),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Conv1d(channels, channels, kernel_size=5, padding=2),
         )
         self.norm = nn.GroupNorm(8, channels)
