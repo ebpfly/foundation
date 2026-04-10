@@ -546,3 +546,16 @@ weak to prevent this.
 
 Same as iter_grid100 but `w_kl=0.1` (10× higher). Forces the latent to
 maintain meaningful variance so epistemic uncertainty can track band count.
+
+### `iter_grid_clamp` — Grid decoder + log_sigma clamp floor fix
+
+log_sigma clamp raised from -10 to -2. Prevents posterior collapse.
+
+| Epoch | RMSE@400 | Factor | Sharp ratio | z_surf_ls |
+|-------|----------|--------|-------------|-----------|
+| 50    | **3.06** | **5.02×** | 0.96×    | -0.95     |
+
+**Best RMSE (3.06) and factor (5.02×) ever at 50 epochs.**
+Posterior no longer collapsed (z_ls=-0.95 vs -9.5 before), but
+z_log_sigma still doesn't vary much with band count (-0.96 to -0.94).
+Waiting for epoch 100.
