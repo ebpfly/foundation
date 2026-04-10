@@ -510,3 +510,18 @@ Hypothesis: conv decoder should reconstruct sharp spectral features better
 because it has spatial awareness.
 
 Training 50 epochs. 5-epoch smoke test showed factor 1.66× (promising).
+
+| Epoch | RMSE@400 | Factor | Sharp ratio |
+|-------|----------|--------|-------------|
+| 10    | 13.04    | 1.67×  | 5.82×       |
+| 20    | 10.13    | 1.79×  | 1.78×       |
+| 30    | 6.94     | 1.54×  | 0.85×       |
+| 40    | 5.82     | 2.44×  | 1.16×       |
+| 50    | **4.47** | **3.50×** | 0.80×    |
+
+**Grid decoder reaches MLP's 200-epoch RMSE in 50 epochs.** Converges ~4×
+faster. Sharpness ratio still inverted — uncertainty not scaling correctly.
+
+### `iter_grid100` — Grid decoder 100 epochs
+
+Same as iter_grid50 but 100 epochs to see where it plateaus.
