@@ -6,13 +6,15 @@ K=1 dimension, but the architecture is already set up to handle
 multi-pixel scenes without any model changes.
 
 Usage:
-    # Quick test with synthetic spectra (no external data):
-    python -m spectralnp.training.train_foundation --epochs 10
-
-    # Full training with USGS data:
+    # LWIR (default) — uses synthetic emissivity library:
     python -m spectralnp.training.train_foundation \
-        --usgs-data /path/to/ASCIIdata_splib07a \
-        --epochs 100 --samples-per-epoch 5000
+        --lwir-library data/lwir_library \
+        --epochs 50 --samples-per-epoch 5000
+
+    # VNIR-SWIR — uses USGS reflectance library:
+    python -m spectralnp.training.train_foundation \
+        --mode vnir --usgs-data /path/to/ASCIIdata_splib07a \
+        --epochs 50 --samples-per-epoch 5000
 """
 
 from __future__ import annotations
@@ -26,34 +28,34 @@ import torch
 from torch.utils.data import DataLoader
 
 from spectralnp.data.dataset import SpectralNPDataset, collate_spectral_batch
+from spectralnp.data.lwir_dataset import LWIRDataset
 from spectralnp.model.foundation import FoundationConfig, SpectralFoundation
 
 
 def collect_pca_spectra(
-    dataset: SpectralNPDataset,
+    dataset,
     n_samples: int = 5000,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate samples from the dataset to fit PCA bases.
 
     Returns (radiance, reflectance) arrays of shape (n_samples, n_wavelengths).
+
+    Note: iterates the dataset directly (not via DataLoader) so the
+    number of samples drawn is independent of ``dataset.samples_per_epoch``.
     """
-    loader = DataLoader(
-        dataset,
-        batch_size=min(128, n_samples),
-        collate_fn=collate_spectral_batch,
-        num_workers=0,
-    )
     rad_list, refl_list = [], []
     n = 0
-    for batch in loader:
-        rad_list.append(batch["target_radiance"].numpy())
-        refl_list.append(batch["target_reflectance"].numpy())
-        n += batch["target_radiance"].shape[0]
-        if n >= n_samples:
-            break
+    while n < n_samples:
+        for i in range(len(dataset)):
+            s = dataset[i]
+            rad_list.append(s["target_radiance"].numpy())
+            refl_list.append(s["target_reflectance"].numpy())
+            n += 1
+            if n >= n_samples:
+                break
     return (
-        np.concatenate(rad_list)[:n_samples],
-        np.concatenate(refl_list)[:n_samples],
+        np.stack(rad_list[:n_samples]),
+        np.stack(refl_list[:n_samples]),
     )
 
 
@@ -62,28 +64,46 @@ def train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Spectral library ----
-    if args.usgs_data:
-        from spectralnp.data.usgs_speclib import load_from_directory
-        speclib = load_from_directory(args.usgs_data)
-        print(f"Loaded {len(speclib)} USGS spectra")
-    else:
-        from spectralnp.data.synthetic_speclib import generate_synthetic_library
-        wl_grid = np.arange(380.0, 2501.0, 5.0)
-        speclib = generate_synthetic_library(
-            n_per_class=60, wavelength_nm=wl_grid, seed=args.seed,
-        )
-        print(f"Generated {len(speclib)} synthetic spectra")
-
     # ---- Dataset ----
-    dense_wl = np.arange(380.0, 2501.0, 5.0)
-    dataset = SpectralNPDataset(
-        spectral_library=speclib,
-        dense_wavelength_nm=dense_wl,
-        samples_per_epoch=args.samples_per_epoch,
-        n_bands_range=(3, 200),
-        seed=args.seed,
-    )
+    if args.mode == "lwir":
+        if not args.lwir_library:
+            raise ValueError(
+                "--lwir-library is required in LWIR mode. "
+                "Generate one with scripts/generate_lwir_library.py"
+            )
+        dataset = LWIRDataset(
+            library_path=args.lwir_library,
+            samples_per_epoch=args.samples_per_epoch,
+            n_bands_range=(3, 200),
+            fwhm_range_nm=(10.0, 200.0),
+            seed=args.seed,
+        )
+        dense_wl = dataset.dense_wl
+        print(f"LWIR library: {dataset.n_spectra} spectra, "
+              f"{dataset.n_material_classes} classes, "
+              f"grid {dense_wl[0]:.0f}-{dense_wl[-1]:.0f} nm "
+              f"({len(dense_wl)} bands)")
+    else:
+        if args.usgs_data:
+            from spectralnp.data.usgs_speclib import load_from_directory
+            speclib = load_from_directory(args.usgs_data)
+            print(f"Loaded {len(speclib)} USGS spectra")
+        else:
+            from spectralnp.data.synthetic_speclib import generate_synthetic_library
+            wl_grid = np.arange(380.0, 2501.0, 5.0)
+            speclib = generate_synthetic_library(
+                n_per_class=60, wavelength_nm=wl_grid, seed=args.seed,
+            )
+            print(f"Generated {len(speclib)} synthetic spectra")
+
+        dense_wl = np.arange(380.0, 2501.0, 5.0)
+        dataset = SpectralNPDataset(
+            spectral_library=speclib,
+            dense_wavelength_nm=dense_wl,
+            samples_per_epoch=args.samples_per_epoch,
+            n_bands_range=(3, 200),
+            seed=args.seed,
+        )
     n_material_classes = dataset.n_material_classes
 
     loader = DataLoader(
@@ -277,7 +297,12 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Train disentangled spectral foundation")
 
     # Data
-    p.add_argument("--usgs-data", type=str, default=None)
+    p.add_argument("--mode", choices=["lwir", "vnir"], default="lwir",
+                    help="Spectral regime to train on")
+    p.add_argument("--lwir-library", type=str, default="data/lwir_library",
+                    help="Base path to ENVI .sli LWIR emissivity library")
+    p.add_argument("--usgs-data", type=str, default=None,
+                    help="Path to USGS reflectance data (VNIR mode only)")
     p.add_argument("--samples-per-epoch", type=int, default=5000)
     p.add_argument("--n-pca-samples", type=int, default=5000)
 

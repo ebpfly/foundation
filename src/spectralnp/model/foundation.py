@@ -266,6 +266,79 @@ class SpectralFoundation(nn.Module):
         )
 
     # ------------------------------------------------------------------
+    # Checkpoint loading
+    # ------------------------------------------------------------------
+
+    def resize_from_state_dict(self, state_dict: dict[str, Tensor]) -> None:
+        """Resize PCA buffers and rebuild stage-2 networks to match a checkpoint.
+
+        The stage-2 layer dimensions depend on the fitted PCA rank, which
+        is only known after ``fit_pca``.  When loading a saved model we
+        don't want to re-fit PCA — instead, inspect the state_dict and
+        resize the placeholder buffers + rebuild the MLPs with the right
+        input/output sizes.  After this call, ``load_state_dict`` will
+        succeed.
+        """
+        device = self.rad_pca_mean.device
+
+        # Required PCA buffers
+        required_keys = [
+            "wavelength_nm",
+            "rad_pca_mean",
+            "rad_pca_components",
+            "rad_pca_variances",
+            "refl_pca_mean",
+            "refl_pca_components",
+        ]
+        for key in required_keys:
+            if key not in state_dict:
+                raise KeyError(
+                    f"state_dict missing required PCA buffer '{key}'"
+                )
+
+        # Resize buffers by setting empty tensors with the target shape.
+        self.wavelength_nm = torch.empty_like(state_dict["wavelength_nm"]).to(device)
+        self.rad_pca_mean = torch.empty_like(state_dict["rad_pca_mean"]).to(device)
+        self.rad_pca_components = torch.empty_like(
+            state_dict["rad_pca_components"]
+        ).to(device)
+        self.rad_pca_variances = torch.empty_like(
+            state_dict["rad_pca_variances"]
+        ).to(device)
+        self.refl_pca_mean = torch.empty_like(state_dict["refl_pca_mean"]).to(device)
+        self.refl_pca_components = torch.empty_like(
+            state_dict["refl_pca_components"]
+        ).to(device)
+
+        # Derive the actual PCA dimensions from the stored components.
+        n_pca_rad = state_dict["rad_pca_components"].shape[0]
+        n_pca_refl = state_dict["refl_pca_components"].shape[0]
+        self.config.n_pca_radiance = n_pca_rad
+        self.config.n_pca_reflectance = n_pca_refl
+
+        # Rebuild stage-2 networks with the correct sizes.
+        self._build_networks(n_pca_rad=n_pca_rad, n_pca_refl=n_pca_refl)
+        self.to(device)
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        path,
+        map_location: str | torch.device = "cpu",
+    ) -> "SpectralFoundation":
+        """Load a model from a checkpoint saved by the training script.
+
+        Handles the auto-sized stage-2 layers: reads the PCA dimensions
+        from the stored state_dict, rebuilds the network, then loads.
+        """
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        config: FoundationConfig = ckpt["config"]
+        model = cls(config)
+        model.resize_from_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(ckpt["model_state_dict"])
+        return model
+
+    # ------------------------------------------------------------------
     # PCA fitting
     # ------------------------------------------------------------------
 
@@ -291,6 +364,12 @@ class SpectralFoundation(nn.Module):
         if n <= 0 or n > max_rad:
             n = max_rad
         variances = S_rad[:n] ** 2 / max(len(radiance_spectra) - 1, 1)
+        # Floor small eigenvalues at 1e-6 of the largest.  This keeps
+        # the Bayesian update well-conditioned and prevents the physics
+        # loss (which divides by prior_std) from exploding when
+        # sample-covariance tails are noisy.
+        var_floor = float(variances.max()) * 1e-6
+        variances = np.maximum(variances, var_floor)
 
         self.rad_pca_mean = torch.from_numpy(rad_mean.astype(np.float32)).to(device)
         self.rad_pca_components = torch.from_numpy(Vt_rad[:n].astype(np.float32)).to(device)
