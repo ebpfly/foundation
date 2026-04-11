@@ -177,19 +177,13 @@ def train_one_epoch(
             query_wavelength=target_wl,
         )
 
-        # Target posterior for NP KL: encode the ground-truth spectrum
-        # directly via a separate MLP (not the attention encoder). This
-        # gives a strictly more informative target that the context
-        # encoder must learn to approach as it gets more input bands.
-        if hasattr(model, 'target_encoder'):
-            prior_mu, prior_log_sigma = model.encode_target(target_rad)
-        else:
-            # Fallback for non-grid models: use the attention encoder.
-            with torch.no_grad():
-                dense_fwhm = torch.ones_like(target_wl) * 1.0
-                _, _, _, _, _, prior_mu, prior_log_sigma = model.encode(
-                    target_wl, dense_fwhm, target_rad
-                )
+        # Target posterior: encode ALL dense grid points through the same
+        # encoder. This must be strictly more informative than the context.
+        with torch.no_grad():
+            dense_fwhm = torch.ones_like(target_wl) * 1.0  # 1nm FWHM
+            _, _, _, _, _, prior_mu, prior_log_sigma = model.encode(
+                target_wl, dense_fwhm, target_rad
+            )
 
         # Override KL weight for annealing.
         original_kl = loss_fn.w_kl
