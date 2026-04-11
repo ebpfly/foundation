@@ -145,7 +145,7 @@ class GridDecoder(nn.Module):
 
         # Project z to a spatial feature map: (B, z_dim) → (B, C, L_init)
         # Start with a small spatial dimension and upsample.
-        self.l_init = max(n_grid // 8, 16)
+        self.l_init = max(n_grid // 2, 16)
         self.proj = nn.Linear(z_dim, hidden_channels * self.l_init)
         self.z_drop = nn.Dropout(dropout)
 
