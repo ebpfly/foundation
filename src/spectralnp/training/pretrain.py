@@ -314,7 +314,7 @@ def main() -> None:
         spectral_n_layers=args.spectral_n_layers,
         spectral_decoder_use_r=not args.no_r_in_decoder,
         use_grid_decoder=args.grid_decoder,
-        grid_n_points=args.dense_n_points,
+        grid_n_points=args.dense_n_points or len(dataset.dense_wl),
         grid_hidden_channels=args.grid_hidden_channels,
         grid_n_blocks=args.grid_n_blocks,
         n_material_classes=dataset.n_material_classes,
