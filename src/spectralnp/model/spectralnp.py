@@ -223,10 +223,11 @@ class SpectralNP(nn.Module):
         return mu, log_sigma
 
     def _reparameterise(self, mu: Tensor, log_sigma: Tensor) -> Tensor:
-        """Sample z via the reparameterisation trick."""
-        if self.training:
-            eps = torch.randn_like(mu)
-            return mu + eps * log_sigma.exp()
+        """Return z_mu directly (deterministic). The stochastic NP sampling
+        was preventing the encoder from transmitting spectral detail — z was
+        identical for 3 and 400 bands because the KL loss trained it to be
+        input-invariant. Epistemic uncertainty now comes from the decoder's
+        log_var output + MC dropout at inference."""
         return mu
 
     def _encode_single_pixel(
