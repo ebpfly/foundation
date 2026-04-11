@@ -243,8 +243,14 @@ class StochasticEncoder(nn.Module):
         # Register fixed wavelength positions for RoPE.
         query_wl = torch.linspace(wl_range[0], wl_range[1], n_queries)
         self.register_buffer("query_wavelengths", query_wl)
-        # Learnable per-query bias (added to wavelength encoding).
-        self.query_bias = nn.Parameter(torch.randn(n_queries, d_model) * 0.02)
+        # Initialize queries with sinusoidal wavelength encoding so each
+        # query starts wavelength-aware from epoch 0.
+        half = d_model // 2
+        freq_seq = torch.arange(half)
+        inv_freq = 1.0 / (10000.0 ** (freq_seq / half))
+        phase = query_wl.unsqueeze(-1) * inv_freq  # (n_queries, half)
+        init_enc = torch.cat([phase.sin(), phase.cos()], dim=-1)  # (n_queries, d_model)
+        self.query_bias = nn.Parameter(init_enc * 0.1)
         # Cross-attention with RoPE on wavelength for locality.
         self.cross_attn = SpectralCrossAttention(d_model, n_heads)
         self.norm = nn.LayerNorm(d_model)
