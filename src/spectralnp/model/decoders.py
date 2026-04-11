@@ -207,6 +207,8 @@ class GridDecoder(nn.Module):
         h = self.final_upsample(h)  # (B, C, n_grid)
         mu = self.mu_head(h).squeeze(1)          # (B, n_grid)
         log_var = self.logvar_head(h).squeeze(1)  # (B, n_grid)
+        # Clamp log_var to prevent numerical explosion.
+        log_var = log_var.clamp(-7.0, 4.0)
         return mu, log_var
 
 
