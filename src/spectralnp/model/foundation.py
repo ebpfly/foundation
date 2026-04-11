@@ -47,10 +47,14 @@ class FoundationConfig:
     """Configuration for the spectral foundation model."""
 
     # ---- PCA dimensions ----
-    # Set to 0 to use full rank (recommended — the point of PCA here is
-    # decorrelation, not dimensionality reduction).
+    # Set to 0 to auto-truncate by eigenvalue ratio (recommended).
+    # We keep components whose singular value squared is at least
+    # ``pca_eigvalue_floor_ratio`` × the largest — components below that
+    # are dominated by sample-covariance noise and destabilize the
+    # Bayesian solve.
     n_pca_radiance: int = 0
     n_pca_reflectance: int = 0
+    pca_eigvalue_floor_ratio: float = 1e-4
 
     # ---- Latents ----
     z_atm_dim: int = 32       # scene-shared atmospheric latent (small)
@@ -359,30 +363,44 @@ class SpectralFoundation(nn.Module):
         rad_mean = radiance_spectra.mean(axis=0)
         centered = radiance_spectra - rad_mean
         _U, S_rad, Vt_rad = np.linalg.svd(centered, full_matrices=False)
-        max_rad = len(S_rad)
-        n = self.config.n_pca_radiance
-        if n <= 0 or n > max_rad:
-            n = max_rad
-        variances = S_rad[:n] ** 2 / max(len(radiance_spectra) - 1, 1)
-        # Floor small eigenvalues at 1e-6 of the largest.  This keeps
-        # the Bayesian update well-conditioned and prevents the physics
-        # loss (which divides by prior_std) from exploding when
-        # sample-covariance tails are noisy.
-        var_floor = float(variances.max()) * 1e-6
-        variances = np.maximum(variances, var_floor)
+        all_variances = S_rad ** 2 / max(len(radiance_spectra) - 1, 1)
+
+        # Truncate by eigenvalue ratio — drop components below
+        # config.pca_eigvalue_floor_ratio × max eigenvalue.  This keeps
+        # the Bayesian update's Lambda matrix well-conditioned in float32.
+        max_var = float(all_variances.max())
+        floor_var = max_var * self.config.pca_eigvalue_floor_ratio
+        effective_rank = int(np.sum(all_variances >= floor_var))
+
+        # User-specified cap (n_pca_radiance) still applies
+        n_req = self.config.n_pca_radiance
+        if n_req <= 0:
+            n = effective_rank
+        else:
+            n = min(n_req, effective_rank, len(S_rad))
+
+        variances = all_variances[:n].copy()
+        # Tiny prior floor to avoid exact zeros in the precision
+        variances = np.maximum(variances, max_var * 1e-8)
 
         self.rad_pca_mean = torch.from_numpy(rad_mean.astype(np.float32)).to(device)
         self.rad_pca_components = torch.from_numpy(Vt_rad[:n].astype(np.float32)).to(device)
         self.rad_pca_variances = torch.from_numpy(variances.astype(np.float32)).to(device)
 
-        # --- Reflectance PCA ---
+        # --- Reflectance PCA (same eigenvalue-ratio truncation) ---
         refl_mean = reflectance_spectra.mean(axis=0)
         centered = reflectance_spectra - refl_mean
         _U, S_refl, Vt_refl = np.linalg.svd(centered, full_matrices=False)
-        max_refl = len(S_refl)
-        m = self.config.n_pca_reflectance
-        if m <= 0 or m > max_refl:
-            m = max_refl
+        all_refl_variances = S_refl ** 2 / max(len(reflectance_spectra) - 1, 1)
+        max_refl_var = float(all_refl_variances.max())
+        refl_floor = max_refl_var * self.config.pca_eigvalue_floor_ratio
+        effective_refl_rank = int(np.sum(all_refl_variances >= refl_floor))
+
+        m_req = self.config.n_pca_reflectance
+        if m_req <= 0:
+            m = effective_refl_rank
+        else:
+            m = min(m_req, effective_refl_rank, len(S_refl))
 
         self.refl_pca_mean = torch.from_numpy(refl_mean.astype(np.float32)).to(device)
         self.refl_pca_components = torch.from_numpy(Vt_refl[:m].astype(np.float32)).to(device)
@@ -472,16 +490,27 @@ class SpectralFoundation(nn.Module):
         AtWA = torch.matmul(Aw.transpose(-1, -2), Aw)
         eye_K = torch.eye(K, device=device)
         Lambda = torch.diag(prior_prec).unsqueeze(0) + AtWA
-        Lambda = Lambda + 1e-6 * eye_K.unsqueeze(0)
+        # Relative jitter — scaled to the diagonal magnitude so it
+        # matters regardless of the prior-precision scale.
+        diag_scale = torch.diagonal(Lambda, dim1=-2, dim2=-1).max(dim=-1).values
+        jitter = 1e-5 * diag_scale.view(-1, 1, 1) * eye_K.unsqueeze(0)
+        Lambda = Lambda + jitter
 
         # Use linalg.solve instead of cholesky_solve for MPS compatibility.
-        # Lambda is SPD by construction so either works mathematically.
+        # Lambda is SPD by construction.  If MPS float32 fails (happens
+        # with very ill-conditioned LWIR matrices), retry in float64 on
+        # CPU and move the result back.
         Atb = torch.matmul(Aw.transpose(-1, -2), bw.unsqueeze(-1))
-        mu_c = torch.linalg.solve(Lambda, Atb).squeeze(-1)
-
-        Sigma = torch.linalg.solve(
-            Lambda, eye_K.unsqueeze(0).expand(B, -1, -1),
-        )
+        eye_batched = eye_K.unsqueeze(0).expand(B, -1, -1)
+        try:
+            mu_c = torch.linalg.solve(Lambda, Atb).squeeze(-1)
+            Sigma = torch.linalg.solve(Lambda, eye_batched)
+        except torch._C._LinAlgError:
+            L64 = Lambda.detach().cpu().double()
+            A64 = Atb.detach().cpu().double()
+            E64 = eye_batched.cpu().double()
+            mu_c = torch.linalg.solve(L64, A64).squeeze(-1).to(device, dtype=torch.float32)
+            Sigma = torch.linalg.solve(L64, E64).to(device, dtype=torch.float32)
         var_c = torch.diagonal(Sigma, dim1=-2, dim2=-1)
 
         if return_full_cov:
