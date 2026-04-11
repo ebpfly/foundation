@@ -143,20 +143,23 @@ class GridDecoder(nn.Module):
         super().__init__()
         self.n_grid = n_grid
 
-        # Project z to a spatial feature map: (B, z_dim) → (B, C, L_init)
-        # Start with a small spatial dimension and upsample.
-        self.l_init = max(n_grid // 2, 16)
+        # Progressive decoder: small projection → learnable upsampling.
+        # z → Linear → (C, 27) → ConvT ×4 → (C, 432) → trim → (C, 425)
+        # Each stage: ConvTranspose1d(stride=2) doubles resolution + ResBlock.
+        self.l_init = 27  # ~27 points, 4 doublings → 432 (≥ 425)
         self.proj = nn.Linear(z_dim, hidden_channels * self.l_init)
         self.z_drop = nn.Dropout(dropout)
 
-        # Residual 1D conv blocks with increasing resolution.
-        blocks: list[nn.Module] = []
+        # 4 upsample stages: 27 → 54 → 108 → 216 → 432
+        self.up_stages = nn.ModuleList()
         for _ in range(n_blocks):
-            blocks.append(_ResConvBlock(hidden_channels, dropout))
-        self.blocks = nn.Sequential(*blocks)
+            self.up_stages.append(nn.Sequential(
+                nn.ConvTranspose1d(hidden_channels, hidden_channels,
+                                   kernel_size=4, stride=2, padding=1),
+                nn.GELU(),
+                _ResConvBlock(hidden_channels, dropout),
+            ))
 
-        # Upsample to target grid size, then final projection.
-        self.upsample = nn.Upsample(size=n_grid, mode="linear", align_corners=False)
         # Output: 2 channels (mu, log_var) per grid point.
         self.head = nn.Sequential(
             nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
@@ -186,9 +189,11 @@ class GridDecoder(nn.Module):
         log_var : Tensor[B, n_grid]
         """
         B = z.shape[0]
-        h = self.z_drop(self.proj(z)).reshape(B, -1, self.l_init)  # (B, C, L_init)
-        h = self.blocks(h)
-        h = self.upsample(h)  # (B, C, n_grid)
+        h = self.z_drop(self.proj(z)).reshape(B, -1, self.l_init)  # (B, C, 27)
+        for stage in self.up_stages:
+            h = stage(h)  # doubles spatial dim each time
+        # Trim to exact grid size (432 → 425).
+        h = h[:, :, :self.n_grid]  # (B, C, n_grid)
         out = self.head(h)    # (B, 2, n_grid)
         mu = out[:, 0, :]      # (B, n_grid)
         log_var = out[:, 1, :] # (B, n_grid)
