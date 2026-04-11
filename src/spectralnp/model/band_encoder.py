@@ -104,8 +104,6 @@ class BandEncoder(nn.Module):
 
         # Wavelength-conditioned radiance encoder.
         # Input: radiance (1) + spectral position embedding (d_model) -> d_model.
-        # The radiance value is the primary signal — spectral position tells
-        # the model what the radiance means, but radiance must dominate.
         self.radiance_mlp = nn.Sequential(
             nn.Linear(1 + d_model, d_model),
             nn.GELU(),
@@ -114,14 +112,13 @@ class BandEncoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        # Combine: only radiance features go through (no position skip path).
-        # Position is already baked into rad_feat via the conditioned MLP.
-        # Adding a raw position skip path lets the model bypass radiance.
+        # Final projection: combine spectral position and radiance features.
         self.combine = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(2 * d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(
         self,
@@ -148,11 +145,8 @@ class BandEncoder(nn.Module):
         pos = self.spectral_pos(wavelength, fwhm)  # (B, N, d_model)
 
         # Radiance encoder is conditioned on spectral position.
-        # Position tells the model what wavelength region this is;
-        # radiance is the actual measured value.
         rad_input = torch.cat([radiance.unsqueeze(-1), pos], dim=-1)
         rad_feat = self.radiance_mlp(rad_input)  # (B, N, d_model)
 
-        # No position skip path — all information must flow through
-        # the radiance-conditioned features.
-        return self.combine(rad_feat)
+        h = self.combine(torch.cat([pos, rad_feat], dim=-1))
+        return self.norm(h)

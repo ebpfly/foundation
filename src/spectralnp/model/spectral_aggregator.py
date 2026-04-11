@@ -159,57 +159,6 @@ class CrossAttention(nn.Module):
         return self.out_proj(out.transpose(1, 2).reshape(B, Nq, D))
 
 
-class SpectralCrossAttention(nn.Module):
-    """Cross-attention with RoPE on wavelength for spectral locality.
-
-    Queries and keys are positioned at specific wavelengths. RoPE makes
-    each query naturally attend to nearby-wavelength keys, so the
-    cross-attention extracts LOCAL spectral values rather than global
-    material identity.
-    """
-
-    def __init__(self, d_model: int, n_heads: int) -> None:
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.kv_proj = nn.Linear(d_model, 2 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-
-    def forward(
-        self, queries: Tensor, context: Tensor,
-        query_wl: Tensor, context_wl: Tensor,
-        mask: Tensor | None = None,
-    ) -> Tensor:
-        B, Nq, D = queries.shape
-        Nk = context.shape[1]
-        q = self.q_proj(queries).reshape(B, Nq, self.n_heads, self.head_dim)
-        kv = self.kv_proj(context).reshape(B, Nk, 2, self.n_heads, self.head_dim)
-        k, v = kv.unbind(dim=2)
-
-        # Apply RoPE using wavelength as position.
-        cos_q, sin_q = _rotary_embedding(query_wl, self.head_dim)
-        cos_k, sin_k = _rotary_embedding(context_wl, self.head_dim)
-        cos_q = cos_q.unsqueeze(2)  # (B, Nq, 1, head_dim//2)
-        sin_q = sin_q.unsqueeze(2)
-        cos_k = cos_k.unsqueeze(2)
-        sin_k = sin_k.unsqueeze(2)
-        q = _apply_rotary(q, cos_q, sin_q)
-        k = _apply_rotary(k, cos_k, sin_k)
-
-        q = q.transpose(1, 2)  # (B, n_heads, Nq, head_dim)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        if mask is not None:
-            attn_mask = mask.unsqueeze(1).unsqueeze(2)
-        else:
-            attn_mask = None
-
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        return self.out_proj(out.transpose(1, 2).reshape(B, Nq, D))
-
-
 # ---------------------------------------------------------------------------
 # Neural Process stochastic path
 # ---------------------------------------------------------------------------
@@ -227,8 +176,7 @@ class StochasticEncoder(nn.Module):
     learn WHICH information to extract regardless of N.
     """
 
-    def __init__(self, d_model: int, z_dim: int, n_heads: int = 4, n_queries: int = 64,
-                 wl_range: tuple[float, float] = (380.0, 2500.0)) -> None:
+    def __init__(self, d_model: int, z_dim: int, n_heads: int = 4, n_queries: int = 32) -> None:
         super().__init__()
         self.n_queries = n_queries
         self.pre = nn.Sequential(
@@ -236,52 +184,36 @@ class StochasticEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
-        # Wavelength-anchored queries: each query is positioned at a specific
-        # wavelength and attends to nearby input bands. This makes z
-        # VALUE-dependent (extracting local spectral values) rather than
-        # just IDENTITY-dependent (extracting material type).
-        # Register fixed wavelength positions for RoPE.
-        query_wl = torch.linspace(wl_range[0], wl_range[1], n_queries)
-        self.register_buffer("query_wavelengths", query_wl)
-        # Initialize queries with sinusoidal wavelength encoding so each
-        # query starts wavelength-aware from epoch 0.
-        half = d_model // 2
-        freq_seq = torch.arange(half)
-        inv_freq = 1.0 / (10000.0 ** (freq_seq / half))
-        phase = query_wl.unsqueeze(-1) * inv_freq  # (n_queries, half)
-        init_enc = torch.cat([phase.sin(), phase.cos()], dim=-1)  # (n_queries, d_model)
-        self.query_bias = nn.Parameter(init_enc * 0.1)
-        # Cross-attention with RoPE on wavelength for locality.
-        self.cross_attn = SpectralCrossAttention(d_model, n_heads)
+        # Learned queries that attend to band features.
+        self.queries = nn.Parameter(torch.randn(n_queries, d_model) * 0.02)
+        self.cross_attn = CrossAttention(d_model, n_heads)
         self.norm = nn.LayerNorm(d_model)
+        # Flatten K attended queries and project to z — preserves the
+        # per-query structure instead of destroying it with mean-pool.
+        # K*d_model → z_dim captures much more spectral detail.
         self.to_mu = nn.Linear(n_queries * d_model, z_dim)
         self.to_log_sigma = nn.Linear(n_queries * d_model, z_dim)
 
-    def forward(self, h: Tensor, mask: Tensor | None = None,
-                input_wavelength: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, h: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Return (mu, log_sigma) of q(z | context).
 
         h : (B, N, d_model)
         mask : (B, N) bool, True = valid
-        input_wavelength : (B, N) wavelengths of input bands (for RoPE)
         """
         s = self.pre(h)  # (B, N, d_model)
         B = s.shape[0]
-        # Wavelength-anchored queries with RoPE-based locality.
-        query_wl = self.query_wavelengths.unsqueeze(0).expand(B, -1)  # (B, K)
-        queries = self.query_bias.unsqueeze(0).expand(B, -1, -1)  # (B, K, d)
-        attended = self.cross_attn(
-            queries, s, query_wl, input_wavelength, mask=mask
-        )  # (B, K, d)
+        # Cross-attend: learned queries → band features.
+        queries = self.queries.unsqueeze(0).expand(B, -1, -1)  # (B, K, d)
+        attended = self.cross_attn(queries, s, mask=mask)       # (B, K, d)
         attended = self.norm(attended)
+        # Flatten K×d into a single vector — preserves per-query structure.
         flat = attended.reshape(B, -1)  # (B, K*d)
         mu = self.to_mu(flat)
         log_sigma = self.to_log_sigma(flat)
-        # Clamp for numerical stability only. Allow tight posteriors
-        # (low log_sigma) when the encoder is confident — this is what
-        # gives us band-count-dependent uncertainty.
-        # -6 → sigma ≈ 0.0025 (very tight but not zero)
-        log_sigma = log_sigma.clamp(-6.0, 2.0)
+        # Clamp log_sigma. The floor prevents posterior collapse — if too
+        # low, z becomes deterministic and epistemic uncertainty vanishes.
+        # -2 → sigma ≈ 0.14, enough variance for meaningful z-sampling.
+        log_sigma = log_sigma.clamp(-2.0, 2.0)
         return mu, log_sigma
 
 
@@ -375,8 +307,7 @@ class SpectralAggregator(nn.Module):
         r = self.det_pool(det.mean(dim=1))  # (B, d_model)
 
         # --- Stochastic path ---
-        # Pass wavelength for RoPE-based spectral locality in cross-attention.
-        z_mu, z_log_sigma = self.stochastic(h, pad_mask, input_wavelength=wavelength)
+        z_mu, z_log_sigma = self.stochastic(h, pad_mask)
 
         return r, z_mu, z_log_sigma
 
@@ -454,5 +385,5 @@ class CrossPixelAggregator(nn.Module):
         attended = self.cross_attn(queries, pixel_reps, mask=pixel_mask)
         pooled = self.norm(attended).mean(dim=1)  # (B, d_model)
         mu = self.to_mu(pooled)
-        log_sigma = self.to_log_sigma(pooled).clamp(-6.0, 2.0)
+        log_sigma = self.to_log_sigma(pooled).clamp(-2.0, 2.0)
         return mu, log_sigma

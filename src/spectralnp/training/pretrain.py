@@ -177,9 +177,11 @@ def train_one_epoch(
             query_wavelength=target_wl,
         )
 
-        # Target posterior: encode ALL dense grid points through the same
-        # encoder. This must be strictly more informative than the context.
+        # Also compute "target" posterior (all bands) for NP KL.
+        # In pretraining, we pass the dense spectrum through a second
+        # encode call to get the full-information posterior.
         with torch.no_grad():
+            # Target posterior: encode ALL dense grid points as "full information".
             dense_fwhm = torch.ones_like(target_wl) * 1.0  # 1nm FWHM
             _, _, _, _, _, prior_mu, prior_log_sigma = model.encode(
                 target_wl, dense_fwhm, target_rad
@@ -309,7 +311,7 @@ def main() -> None:
         spectral_n_layers=args.spectral_n_layers,
         spectral_decoder_use_r=not args.no_r_in_decoder,
         use_grid_decoder=args.grid_decoder,
-        grid_n_points=args.dense_n_points or len(dataset.dense_wl),
+        grid_n_points=args.dense_n_points,
         grid_hidden_channels=args.grid_hidden_channels,
         grid_n_blocks=args.grid_n_blocks,
         n_material_classes=dataset.n_material_classes,
