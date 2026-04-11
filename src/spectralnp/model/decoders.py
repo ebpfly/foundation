@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from spectralnp.model.band_encoder import SpectralPositionalEncoding
@@ -143,24 +144,26 @@ class GridDecoder(nn.Module):
         super().__init__()
         self.n_grid = n_grid
 
-        # Progressive decoder: small projection → learnable upsampling.
-        # z → Linear → (C, 27) → ConvT ×4 → (C, 432) → trim → (C, 425)
-        # Each stage: ConvTranspose1d(stride=2) doubles resolution + ResBlock.
-        self.l_init = 27  # ~27 points, 4 doublings → 432 (≥ 425)
+        # Start at 53 points (same as old decoder), then 3 upsample stages
+        # using interpolation + conv (no ConvTranspose checkerboard artifacts).
+        # 53 → 106 → 212 → 425 (exact target, no trimming needed).
+        self.l_init = max(n_grid // 8, 16)
         self.proj = nn.Linear(z_dim, hidden_channels * self.l_init)
         self.z_drop = nn.Dropout(dropout)
 
-        # 4 upsample stages: 27 → 54 → 108 → 216 → 432
+        # 3 upsample stages: interpolate 2× then refine with conv+ResBlock.
+        # Plus 1 ResBlock at initial resolution for coarse structure.
+        n_up = 3  # 53 → 106 → 212 → 424
+        self.coarse_block = _ResConvBlock(hidden_channels, dropout)
         self.up_stages = nn.ModuleList()
-        for _ in range(n_blocks):
+        for _ in range(n_up):
             self.up_stages.append(nn.Sequential(
-                nn.ConvTranspose1d(hidden_channels, hidden_channels,
-                                   kernel_size=4, stride=2, padding=1),
+                nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
                 nn.GELU(),
                 _ResConvBlock(hidden_channels, dropout),
             ))
-
-        # Output: 2 channels (mu, log_var) per grid point.
+        # Final upsample to exact grid size + head.
+        self.final_up = nn.Upsample(size=n_grid, mode="linear", align_corners=False)
         self.head = nn.Sequential(
             nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
@@ -189,11 +192,12 @@ class GridDecoder(nn.Module):
         log_var : Tensor[B, n_grid]
         """
         B = z.shape[0]
-        h = self.z_drop(self.proj(z)).reshape(B, -1, self.l_init)  # (B, C, 27)
+        h = self.z_drop(self.proj(z)).reshape(B, -1, self.l_init)  # (B, C, 53)
+        h = self.coarse_block(h)  # coarse structure at 53 points
         for stage in self.up_stages:
-            h = stage(h)  # doubles spatial dim each time
-        # Trim to exact grid size (432 → 425).
-        h = h[:, :, :self.n_grid]  # (B, C, n_grid)
+            h = F.interpolate(h, scale_factor=2, mode="linear", align_corners=False)
+            h = stage(h)  # refine at doubled resolution
+        h = self.final_up(h)  # to exact n_grid
         out = self.head(h)    # (B, 2, n_grid)
         mu = out[:, 0, :]      # (B, n_grid)
         log_var = out[:, 1, :] # (B, n_grid)
