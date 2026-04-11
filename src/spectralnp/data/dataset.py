@@ -370,6 +370,9 @@ class SpectralNPDataset(Dataset):
             "target_radiance": torch.from_numpy(dense_radiance),
             "target_reflectance": torch.from_numpy(reflectance),
             "atmos_params": torch.from_numpy(atmos_params),
+            "surface_temperature_k": torch.tensor(
+                atmos.surface_temperature_k or 300.0, dtype=torch.float32,
+            ),
             "material_idx": int(self.category_id_by_spec[spec_idx]),
         }
 
@@ -395,6 +398,7 @@ def collate_spectral_batch(samples: list[dict]) -> dict[str, torch.Tensor]:
     target_radiance = torch.zeros(batch_size, n_dense)
     target_reflectance = torch.zeros(batch_size, n_dense)
     atmos_params = torch.zeros(batch_size, 4)
+    surface_temperature_k = torch.zeros(batch_size)
     material_idx = torch.zeros(batch_size, dtype=torch.long)
 
     for i, s in enumerate(samples):
@@ -407,6 +411,7 @@ def collate_spectral_batch(samples: list[dict]) -> dict[str, torch.Tensor]:
         target_radiance[i] = s["target_radiance"]
         target_reflectance[i] = s["target_reflectance"]
         atmos_params[i] = s["atmos_params"]
+        surface_temperature_k[i] = s["surface_temperature_k"]
         material_idx[i] = s["material_idx"]
 
     return {
@@ -418,5 +423,6 @@ def collate_spectral_batch(samples: list[dict]) -> dict[str, torch.Tensor]:
         "target_radiance": target_radiance,
         "target_reflectance": target_reflectance,
         "atmos_params": atmos_params,
+        "surface_temperature_k": surface_temperature_k,
         "material_idx": material_idx,
     }
