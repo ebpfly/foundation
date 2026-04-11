@@ -1,25 +1,40 @@
-"""Spectral foundation model with Bayesian PCA observation encoding.
+"""Spectral foundation model with Bayesian PCA + disentangled latents.
 
-Architecture:
-    1. Bayesian update: sparse sensor observations → PCA coefficient posterior
-       (exact linear-Gaussian, no learned parameters)
-    2. VAE encoder: PCA posterior (μ, σ²) → latent z
-    3. VAE decoder: z → three heads (reflectance, atmosphere, temperature)
+Two-stage architecture:
 
-The PCA basis decorrelates the spectrum so that representing the posterior
-as independent means + variances per component is justified.  The Bayesian
-update is closed-form because the observation model (SRF convolution) is
-linear in PCA space.
+  Stage 1 — Bayesian update (no learned parameters):
+      sparse (λ, FWHM, L) → PCA coefficient posterior (μ_c, σ²_c)
+
+  Stage 2 — disentangled VAE:
+      PCA posterior → per-pixel features
+                    → z_atm  (scene-shared, fused across pixels by Gaussian product)
+                    → z_surf (per-pixel, conditioned on z_atm)
+                    → task heads
+
+Task heads:
+    • reflectance  — per-pixel, linear from z_surf via reflectance-PCA basis
+    • material     — per-pixel classification, from z_surf
+    • temperature  — per-pixel, from z_surf  (surface temperature)
+    • atmosphere   — scene-shared, from z_atm  (AOD, H2O, O3, visibility)
+    • physics      — per-pixel radiance reconstruction from (z_atm, z_surf)
+                     as a consistency loss that forces disentanglement
+
+The architecture is always multi-pixel: inputs have shape (B, K, N) with
+K pixels per scene.  K=1 is the normal single-pixel case and the Gaussian
+product over one pixel is trivially that pixel's belief.  When the
+dataloader starts producing multi-pixel scenes (K>1), the model
+automatically tightens z_atm (precisions add), which flows through to
+tighter z_surf via the SurfMLP([h_i, z_atm]) dependency.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -31,33 +46,41 @@ from torch import Tensor
 class FoundationConfig:
     """Configuration for the spectral foundation model."""
 
-    # PCA dimensions.  Set to 0 (or any value larger than the wavelength
-    # grid) to use full-rank PCA — recommended, since the point of PCA
-    # here is decorrelation, not dimensionality reduction.
+    # ---- PCA dimensions ----
+    # Set to 0 to use full rank (recommended — the point of PCA here is
+    # decorrelation, not dimensionality reduction).
     n_pca_radiance: int = 0
     n_pca_reflectance: int = 0
 
-    # Latent
-    z_dim: int = 128
+    # ---- Latents ----
+    z_atm_dim: int = 32       # scene-shared atmospheric latent (small)
+    z_surf_dim: int = 96      # per-pixel surface latent
+    feature_dim: int = 256    # per-pixel shared feature dimension
 
-    # Encoder MLP (PCA posterior → z)
-    encoder_hidden: tuple[int, ...] = (512, 256)
-
-    # Decoder MLPs (z → task outputs)
+    # ---- Network sizes ----
+    trunk_hidden: tuple[int, ...] = (512, 256)
+    head_hidden: tuple[int, ...] = (256, 128)
     decoder_hidden: tuple[int, ...] = (256, 512)
 
-    # Task heads
-    n_atmos_params: int = 4  # AOD, water_vapour, ozone, visibility
+    # ---- Task outputs ----
+    n_atmos_params: int = 4          # AOD, H2O, O3, visibility
+    n_material_classes: int = 10     # set at training time to match dataset
 
-    # Observation noise model for Bayesian update
+    # ---- Observation noise model (Bayesian update) ----
     assumed_snr: float = 200.0
     read_noise: float = 0.1
 
-    # Regularisation
+    # ---- Regularisation ----
     dropout: float = 0.1
 
-    # Training
-    beta: float = 1.0  # KL weight
+    # ---- Training loss weights ----
+    w_refl: float = 1.0
+    w_atmos: float = 1.0
+    w_temp: float = 1.0
+    w_material: float = 0.0   # disabled by default — enable once classes are set
+    w_physics: float = 0.5
+    beta_atm: float = 1.0     # KL weight for z_atm
+    beta_surf: float = 1.0    # KL weight for z_surf
 
 
 # ---------------------------------------------------------------------------
@@ -66,27 +89,40 @@ class FoundationConfig:
 
 @dataclass
 class FoundationOutput:
-    """All outputs from a forward pass."""
+    """All outputs from a forward pass.
 
-    # Reflectance reconstruction
-    reflectance: Tensor          # (B, n_wl)
+    All per-pixel tensors have a K dimension (pixels per scene).
+    """
 
-    # Atmospheric parameters (heteroscedastic)
-    atmos_mu: Tensor             # (B, n_atmos)
-    atmos_log_var: Tensor        # (B, n_atmos)
+    # --- Per-pixel reconstructions ---
+    reflectance: Tensor           # (B, K, n_wl)  surface reflectance
+    radiance_recon: Tensor        # (B, K, n_wl)  physics-consistency radiance
+    rad_coeffs_normed: Tensor     # (B, K, n_pca_rad)  predicted coeffs in prior-std units
 
-    # Surface temperature (heteroscedastic)
-    temp_mu: Tensor              # (B, 1)
-    temp_log_var: Tensor         # (B, 1)
+    # --- Per-pixel task outputs ---
+    temp_mu: Tensor               # (B, K, 1)     surface temperature
+    temp_log_var: Tensor          # (B, K, 1)
+    material_logits: Tensor       # (B, K, n_classes)
 
-    # Latent distribution
-    z: Tensor                    # (B, z_dim) — sampled
-    z_mu: Tensor                 # (B, z_dim)
-    z_log_var: Tensor            # (B, z_dim)
+    # --- Scene-shared task outputs (from z_atm) ---
+    atmos_mu: Tensor              # (B, n_atmos)
+    atmos_log_var: Tensor         # (B, n_atmos)
 
-    # Bayesian update diagnostics
-    pca_mu: Tensor               # (B, n_pca_rad)
-    pca_var: Tensor              # (B, n_pca_rad)
+    # --- Latents ---
+    z_atm: Tensor                 # (B, z_atm_dim)
+    z_atm_mu: Tensor              # (B, z_atm_dim)
+    z_atm_log_var: Tensor         # (B, z_atm_dim)
+
+    z_surf: Tensor                # (B, K, z_surf_dim)
+    z_surf_mu: Tensor             # (B, K, z_surf_dim)
+    z_surf_log_var: Tensor        # (B, K, z_surf_dim)
+
+    # --- Stage-1 diagnostics (per pixel) ---
+    pca_mu: Tensor                # (B, K, n_pca_rad)
+    pca_var: Tensor               # (B, K, n_pca_rad)
+
+    # --- Masks carried through for losses ---
+    pixel_mask: Tensor            # (B, K) bool
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +130,7 @@ class FoundationOutput:
 # ---------------------------------------------------------------------------
 
 class MLP(nn.Module):
-    """MLP with ReLU activations and optional dropout."""
+    """MLP with LayerNorm + GELU + dropout."""
 
     def __init__(
         self,
@@ -121,15 +157,20 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+def _gaussian_kl_standard(mu: Tensor, log_var: Tensor) -> Tensor:
+    """KL( N(μ, σ²) || N(0, I) ), summed over the last dim."""
+    return -0.5 * (1.0 + log_var - mu.pow(2) - log_var.exp()).sum(dim=-1)
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
 class SpectralFoundation(nn.Module):
-    """Bayesian-PCA → VAE spectral foundation model.
+    """Disentangled spectral foundation model.
 
-    Call :meth:`fit_pca` once before training to set the PCA bases from
-    a collection of radiance and reflectance spectra on the dense grid.
+    Call :meth:`fit_pca` once before training to set PCA bases and size
+    all downstream layers.
     """
 
     def __init__(self, config: FoundationConfig) -> None:
@@ -139,35 +180,93 @@ class SpectralFoundation(nn.Module):
         # ---- PCA buffers (populated by fit_pca) ----
         self.register_buffer("wavelength_nm", torch.zeros(1))
         self.register_buffer("rad_pca_mean", torch.zeros(1))
-        self.register_buffer("rad_pca_components", torch.zeros(1, 1))      # (n_pca, W)
-        self.register_buffer("rad_pca_variances", torch.zeros(1))          # (n_pca,)
+        self.register_buffer("rad_pca_components", torch.zeros(1, 1))      # (K, W)
+        self.register_buffer("rad_pca_variances", torch.zeros(1))          # (K,)
         self.register_buffer("refl_pca_mean", torch.zeros(1))
-        self.register_buffer("refl_pca_components", torch.zeros(1, 1))     # (n_pca, W)
+        self.register_buffer("refl_pca_components", torch.zeros(1, 1))     # (M, W)
 
-        # ---- Encoder: (μ_c, σ²_c) → (μ_z, log_σ²_z) ----
-        # Placeholder sizes are used if n_pca is 0 (auto full-rank).
-        # The actual layers are built/rebuilt in fit_pca once PCA is known.
-        enc_in = 2 * max(config.n_pca_radiance, 1)
-        self.encoder = MLP(enc_in, config.encoder_hidden, 2 * config.z_dim, config.dropout)
-
-        # ---- Reflectance head: z → PCA coefficients ----
-        self.reflectance_head = MLP(
-            config.z_dim, config.decoder_hidden,
-            max(config.n_pca_reflectance, 1), config.dropout,
-        )
-
-        # ---- Atmosphere head: z → (μ, log_var) per parameter ----
-        self.atmosphere_head = MLP(
-            config.z_dim, (256, 128), 2 * config.n_atmos_params, config.dropout,
-        )
-
-        # ---- Temperature head: z → (μ, log_var) ----
-        self.temperature_head = MLP(
-            config.z_dim, (256, 128), 2, config.dropout,
+        # ---- Stage 2 networks (placeholder sizes; rebuilt in fit_pca) ----
+        self._build_networks(
+            n_pca_rad=max(config.n_pca_radiance, 1),
+            n_pca_refl=max(config.n_pca_reflectance, 1),
         )
 
     # ------------------------------------------------------------------
-    # PCA fitting (offline, before training)
+    # Network construction
+    # ------------------------------------------------------------------
+
+    def _build_networks(self, n_pca_rad: int, n_pca_refl: int) -> None:
+        c = self.config
+
+        # Per-pixel shared trunk: PCA posterior → feature_dim
+        self.shared_trunk = MLP(
+            in_dim=2 * n_pca_rad,
+            hidden_dims=c.trunk_hidden,
+            out_dim=c.feature_dim,
+            dropout=c.dropout,
+        )
+
+        # Atmospheric pseudo-observation head: per-pixel (μ_atm, log_var_atm)
+        self.atm_pseudo_head = MLP(
+            in_dim=c.feature_dim,
+            hidden_dims=c.head_hidden,
+            out_dim=2 * c.z_atm_dim,
+            dropout=c.dropout,
+        )
+
+        # Surface trunk: [h_i, z_atm] → (μ_surf, log_var_surf)
+        self.surf_trunk = MLP(
+            in_dim=c.feature_dim + c.z_atm_dim,
+            hidden_dims=c.head_hidden,
+            out_dim=2 * c.z_surf_dim,
+            dropout=c.dropout,
+        )
+
+        # ---- Task heads ----
+        # Reflectance: z_surf → reflectance PCA coefficients → spectrum
+        self.reflectance_head = MLP(
+            in_dim=c.z_surf_dim,
+            hidden_dims=c.decoder_hidden,
+            out_dim=n_pca_refl,
+            dropout=c.dropout,
+        )
+
+        # Surface temperature: per-pixel, from z_surf
+        self.temperature_head = MLP(
+            in_dim=c.z_surf_dim,
+            hidden_dims=c.head_hidden,
+            out_dim=2,
+            dropout=c.dropout,
+        )
+
+        # Material classification: per-pixel, from z_surf
+        self.material_head = MLP(
+            in_dim=c.z_surf_dim,
+            hidden_dims=c.head_hidden,
+            out_dim=c.n_material_classes,
+            dropout=c.dropout,
+        )
+
+        # Atmospheric parameters: scene-shared, from z_atm
+        self.atmosphere_head = MLP(
+            in_dim=c.z_atm_dim,
+            hidden_dims=c.head_hidden,
+            out_dim=2 * c.n_atmos_params,
+            dropout=c.dropout,
+        )
+
+        # Physics consistency: (z_atm, z_surf) → radiance PCA coefficients
+        # This is a reconstruction head that forces (z_atm, z_surf) to
+        # jointly explain the observation, enforcing disentanglement.
+        self.physics_head = MLP(
+            in_dim=c.z_atm_dim + c.z_surf_dim,
+            hidden_dims=c.decoder_hidden,
+            out_dim=n_pca_rad,
+            dropout=c.dropout,
+        )
+
+    # ------------------------------------------------------------------
+    # PCA fitting
     # ------------------------------------------------------------------
 
     def fit_pca(
@@ -176,18 +275,7 @@ class SpectralFoundation(nn.Module):
         reflectance_spectra: np.ndarray,
         wavelength_nm: np.ndarray,
     ) -> dict[str, float]:
-        """Fit PCA bases from training data.
-
-        Parameters
-        ----------
-        radiance_spectra : (N, W) at-sensor radiance on the dense grid.
-        reflectance_spectra : (N, W) surface reflectance on the dense grid.
-        wavelength_nm : (W,) the dense wavelength grid in nm.
-
-        Returns
-        -------
-        dict with explained-variance diagnostics.
-        """
+        """Fit PCA bases and rebuild stage-2 networks to match."""
         device = self.rad_pca_mean.device
 
         self.wavelength_nm = torch.from_numpy(
@@ -220,27 +308,19 @@ class SpectralFoundation(nn.Module):
         self.refl_pca_mean = torch.from_numpy(refl_mean.astype(np.float32)).to(device)
         self.refl_pca_components = torch.from_numpy(Vt_refl[:m].astype(np.float32)).to(device)
 
-        # --- Rebuild encoder + reflectance head to match actual PCA sizes ---
+        # --- Rebuild stage 2 networks with the actual PCA sizes ---
         self.config.n_pca_radiance = n
         self.config.n_pca_reflectance = m
-        self.encoder = MLP(
-            2 * n, self.config.encoder_hidden, 2 * self.config.z_dim,
-            self.config.dropout,
-        ).to(device)
-        self.reflectance_head = MLP(
-            self.config.z_dim, self.config.decoder_hidden, m,
-            self.config.dropout,
-        ).to(device)
+        self._build_networks(n_pca_rad=n, n_pca_refl=m)
+        self.to(device)
 
-        explained_rad = float(S_rad[:n].sum() ** 2 / (S_rad ** 2).sum())
-        explained_refl = float(S_refl[:m].sum() ** 2 / (S_refl ** 2).sum())
         return {
-            "radiance_explained_var": (S_rad[:n] ** 2).sum() / (S_rad ** 2).sum(),
-            "reflectance_explained_var": (S_refl[:m] ** 2).sum() / (S_refl ** 2).sum(),
+            "radiance_explained_var": float((S_rad[:n] ** 2).sum() / (S_rad ** 2).sum()),
+            "reflectance_explained_var": float((S_refl[:m] ** 2).sum() / (S_refl ** 2).sum()),
         }
 
     # ------------------------------------------------------------------
-    # Bayesian update (no learned parameters)
+    # Stage 1 — Bayesian update (flat, per-pixel)
     # ------------------------------------------------------------------
 
     def bayesian_update(
@@ -251,13 +331,10 @@ class SpectralFoundation(nn.Module):
         pad_mask: Tensor,
         return_full_cov: bool = False,
     ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
-        """Exact linear-Gaussian update from sparse bands to PCA posterior.
+        """Closed-form linear-Gaussian update from sparse bands to PCA posterior.
 
-        Observation model (per band *i*):
-            y_i = SRF_i · (P^T c + μ) + noise_i
-
-        This is linear in the PCA coefficients *c*, so the posterior is
-        Gaussian with closed-form mean and covariance.
+        Operates on a flat (B, N) batch — multi-pixel inputs are flattened
+        to (B·K, N) by the caller before invoking this method.
 
         Parameters
         ----------
@@ -265,16 +342,13 @@ class SpectralFoundation(nn.Module):
         fwhm       : (B, N)  band FWHMs [nm]
         radiance   : (B, N)  observed at-sensor radiance
         pad_mask   : (B, N)  True = valid band
-        return_full_cov : if True, also return the full (B, K, K) covariance.
-            Needed for correct per-wavelength variance propagation; the
-            diagonal alone discards the off-diagonal correlations that
-            tighten the variance at observed wavelengths.
+        return_full_cov : also return the full (B, K, K) posterior covariance
 
         Returns
         -------
         mu_c  : (B, K)  posterior mean of PCA coefficients
-        var_c : (B, K)  posterior marginal variance (diagonal of Σ_post)
-        Sigma : (B, K, K)  full covariance (only if return_full_cov=True)
+        var_c : (B, K)  posterior marginal variance
+        Sigma : (B, K, K) full covariance (only if return_full_cov)
         """
         B, N = wavelength.shape
         K = self.config.n_pca_radiance
@@ -283,110 +357,125 @@ class SpectralFoundation(nn.Module):
         wl_grid = self.wavelength_nm                          # (W,)
         W = wl_grid.shape[0]
 
-        # --- Build pseudo-Voigt SRFs: (B, N, W) ---
-        # Matches spectralnp.data.srf.pseudo_voigt with eta=0.5.
-        # Must match the forward simulation's SRF model to avoid a
-        # systematic posterior bias at high band counts.
-        wl = wl_grid.view(1, 1, W)                           # broadcast grid
-        ctr = wavelength.unsqueeze(-1)                        # (B, N, 1)
-        width = fwhm.unsqueeze(-1).clamp(min=0.01)           # (B, N, 1)
+        # --- Build pseudo-Voigt SRFs (matches data.srf.pseudo_voigt, eta=0.5) ---
+        wl = wl_grid.view(1, 1, W)
+        ctr = wavelength.unsqueeze(-1)
+        width = fwhm.unsqueeze(-1).clamp(min=0.01)
 
-        sigma = width / 2.355                                 # Gaussian σ
-        gamma = width / 2.0                                   # Lorentzian γ
+        sigma = width / 2.355
+        gamma = width / 2.0
         dx = wl - ctr
         gauss = torch.exp(-0.5 * (dx / sigma) ** 2)
         lorentz = 1.0 / (1.0 + (dx / gamma) ** 2)
         eta = 0.5
         srf = (1.0 - eta) * gauss + eta * lorentz
-        srf = srf / (srf.sum(dim=-1, keepdim=True) + 1e-30)  # normalise
-
-        # Zero out padded bands
+        srf = srf / (srf.sum(dim=-1, keepdim=True) + 1e-30)
         srf = srf * pad_mask.unsqueeze(-1).float()
 
-        # --- Observation matrix in PCA space: A = H P^T  (B, N, K) ---
-        A = torch.matmul(srf, self.rad_pca_components.T)     # (B, N, K)
+        # --- Linear operator in PCA space: A = H P^T ---
+        A = torch.matmul(srf, self.rad_pca_components.T)
 
-        # --- Residual: b = y − H μ  (B, N) ---
-        offset = torch.matmul(srf, self.rad_pca_mean)        # (B, N)
+        # --- Residual: b = y − H μ_rad ---
+        offset = torch.matmul(srf, self.rad_pca_mean)
         b = (radiance - offset) * pad_mask.float()
 
         # --- Per-band noise variance (signal-dependent) ---
         noise_var = (radiance.abs() / self.config.assumed_snr) ** 2 \
                     + self.config.read_noise ** 2
-        noise_var = noise_var + (~pad_mask).float() * 1e10    # kill padding
-        noise_prec = 1.0 / noise_var                          # (B, N)
+        noise_var = noise_var + (~pad_mask).float() * 1e10
+        noise_prec = 1.0 / noise_var
 
-        # --- Weighted observation matrices ---
-        w = noise_prec.sqrt().unsqueeze(-1)                   # (B, N, 1)
-        Aw = A * w                                            # (B, N, K)
-        bw = b * noise_prec.sqrt()                            # (B, N)
+        sqrt_prec = noise_prec.sqrt().unsqueeze(-1)
+        Aw = A * sqrt_prec
+        bw = b * noise_prec.sqrt()
 
-        # --- Posterior precision: Λ = Σ_prior⁻¹ + Aᵀ diag(1/σ²) A ---
-        prior_prec = 1.0 / (self.rad_pca_variances + 1e-10)  # (K,)
-        AtWA = torch.matmul(Aw.transpose(-1, -2), Aw)        # (B, K, K)
+        prior_prec = 1.0 / (self.rad_pca_variances + 1e-10)
+        AtWA = torch.matmul(Aw.transpose(-1, -2), Aw)
         eye_K = torch.eye(K, device=device)
         Lambda = torch.diag(prior_prec).unsqueeze(0) + AtWA
-        Lambda = Lambda + 1e-6 * eye_K.unsqueeze(0)          # jitter
+        Lambda = Lambda + 1e-6 * eye_K.unsqueeze(0)
 
-        # --- Solve via Cholesky ---
-        L = torch.linalg.cholesky(Lambda)                     # (B, K, K)
-        Atb = torch.matmul(Aw.transpose(-1, -2), bw.unsqueeze(-1))  # (B, K, 1)
-        mu_c = torch.cholesky_solve(Atb, L).squeeze(-1)      # (B, K)
+        # Use linalg.solve instead of cholesky_solve for MPS compatibility.
+        # Lambda is SPD by construction so either works mathematically.
+        Atb = torch.matmul(Aw.transpose(-1, -2), bw.unsqueeze(-1))
+        mu_c = torch.linalg.solve(Lambda, Atb).squeeze(-1)
 
-        # Marginal variances = diag(Λ⁻¹)
-        Sigma = torch.cholesky_solve(
-            eye_K.unsqueeze(0).expand(B, -1, -1), L,
+        Sigma = torch.linalg.solve(
+            Lambda, eye_K.unsqueeze(0).expand(B, -1, -1),
         )
-        var_c = torch.diagonal(Sigma, dim1=-2, dim2=-1)      # (B, K)
+        var_c = torch.diagonal(Sigma, dim1=-2, dim2=-1)
 
         if return_full_cov:
             return mu_c, var_c, Sigma
         return mu_c, var_c
 
     # ------------------------------------------------------------------
-    # Encoder / decoder
+    # Stage 2 — disentangled encoding
     # ------------------------------------------------------------------
 
-    def encode(self, mu_c: Tensor, var_c: Tensor) -> tuple[Tensor, Tensor]:
-        """Map PCA posterior to latent distribution q(z | observations).
-
-        Inputs are normalised by prior std so the encoder sees
-        roughly unit-scale features regardless of PCA component ordering.
-        """
+    def _encode_pixels(
+        self,
+        pca_mu: Tensor,     # (B, K, n_pca_rad)
+        pca_var: Tensor,    # (B, K, n_pca_rad)
+    ) -> Tensor:
+        """Map per-pixel PCA posterior to per-pixel feature vector h_i."""
         prior_std = (self.rad_pca_variances + 1e-10).sqrt()
-        mu_norm = mu_c / prior_std
-        var_norm = var_c / (self.rad_pca_variances + 1e-10)
+        mu_norm = pca_mu / prior_std
+        var_norm = pca_var / (self.rad_pca_variances + 1e-10)
+        x = torch.cat([mu_norm, var_norm], dim=-1)            # (B, K, 2*n_pca)
+        return self.shared_trunk(x)                           # (B, K, feature_dim)
 
-        x = torch.cat([mu_norm, var_norm], dim=-1)
-        h = self.encoder(x)
-        mu_z, log_var_z = h.chunk(2, dim=-1)
-        return mu_z, log_var_z
+    def _fuse_atmosphere(
+        self,
+        h: Tensor,                  # (B, K, feature_dim)
+        pixel_mask: Tensor,         # (B, K) bool
+    ) -> tuple[Tensor, Tensor]:
+        """Gaussian-product fusion of per-pixel atmospheric pseudo-observations.
+
+        Each pixel i produces a Gaussian belief (μ_i, σ²_i) about z_atm.
+        The combined posterior is N(μ, σ²) with
+
+            precision_i  = 1 / σ²_i     (masked by pixel_mask)
+            σ²           = 1 / Σ_i precision_i
+            μ            = σ² · Σ_i μ_i precision_i
+
+        With K=1 this degrades to the single pixel's belief.  With K>>1
+        the precision sums and the posterior tightens by √K (in the
+        homoscedastic limit).
+        """
+        out = self.atm_pseudo_head(h)                         # (B, K, 2*z_atm)
+        mu_i, log_var_i = out.chunk(2, dim=-1)
+        # Clamp log_var for stability
+        log_var_i = log_var_i.clamp(-10.0, 10.0)
+
+        prec_i = (-log_var_i).exp()                           # (B, K, z_atm)
+        mask_f = pixel_mask.unsqueeze(-1).float()             # (B, K, 1)
+        prec_i = prec_i * mask_f
+
+        prec_sum = prec_i.sum(dim=1) + 1e-10                  # (B, z_atm)
+        mu_atm = (mu_i * prec_i).sum(dim=1) / prec_sum        # (B, z_atm)
+        log_var_atm = -torch.log(prec_sum)                    # (B, z_atm)
+        return mu_atm, log_var_atm
+
+    def _encode_surface(
+        self,
+        h: Tensor,          # (B, K, feature_dim)
+        z_atm: Tensor,      # (B, z_atm_dim)
+    ) -> tuple[Tensor, Tensor]:
+        """Per-pixel surface latent, conditioned on the shared atmosphere."""
+        B, K, _ = h.shape
+        z_atm_bcast = z_atm.unsqueeze(1).expand(-1, K, -1)
+        x = torch.cat([h, z_atm_bcast], dim=-1)               # (B, K, feat+z_atm)
+        out = self.surf_trunk(x)                              # (B, K, 2*z_surf)
+        mu_surf, log_var_surf = out.chunk(2, dim=-1)
+        return mu_surf, log_var_surf.clamp(-10.0, 10.0)
 
     @staticmethod
     def reparameterize(mu: Tensor, log_var: Tensor) -> Tensor:
-        """Sample z ~ N(mu, diag(exp(log_var))) with the reparameterization trick."""
         if not torch.is_grad_enabled():
             return mu
         std = (0.5 * log_var).exp()
         return mu + std * torch.randn_like(std)
-
-    def decode_reflectance(self, z: Tensor) -> Tensor:
-        """z → surface reflectance on the dense wavelength grid."""
-        coeffs = self.reflectance_head(z)                     # (B, n_pca_refl)
-        refl = torch.matmul(coeffs, self.refl_pca_components) + self.refl_pca_mean
-        return refl.clamp(0.0, 1.0)
-
-    def decode_atmosphere(self, z: Tensor) -> tuple[Tensor, Tensor]:
-        """z → atmospheric parameters with heteroscedastic uncertainty."""
-        out = self.atmosphere_head(z)
-        mu, log_var = out.chunk(2, dim=-1)
-        return mu, log_var.clamp(-7.0, 4.0)
-
-    def decode_temperature(self, z: Tensor) -> tuple[Tensor, Tensor]:
-        """z → surface temperature with heteroscedastic uncertainty."""
-        out = self.temperature_head(z)
-        mu, log_var = out.chunk(2, dim=-1)
-        return mu, log_var.clamp(-7.0, 4.0)
 
     # ------------------------------------------------------------------
     # Forward
@@ -398,92 +487,200 @@ class SpectralFoundation(nn.Module):
         fwhm: Tensor,
         radiance: Tensor,
         pad_mask: Tensor | None = None,
+        pixel_mask: Tensor | None = None,
     ) -> FoundationOutput:
-        B, N = wavelength.shape
+        """Run the full pipeline.
+
+        Accepts either (B, N) single-pixel or (B, K, N) multi-pixel input.
+        Single-pixel input is automatically wrapped to K=1.
+        """
+        # --- Normalize to multi-pixel shape ---
+        if wavelength.dim() == 2:
+            wavelength = wavelength.unsqueeze(1)
+            fwhm = fwhm.unsqueeze(1)
+            radiance = radiance.unsqueeze(1)
+            if pad_mask is not None:
+                pad_mask = pad_mask.unsqueeze(1)
+
+        B, K, N = wavelength.shape
+        device = wavelength.device
         if pad_mask is None:
-            pad_mask = torch.ones(B, N, dtype=torch.bool, device=wavelength.device)
+            pad_mask = torch.ones(B, K, N, dtype=torch.bool, device=device)
+        if pixel_mask is None:
+            pixel_mask = torch.ones(B, K, dtype=torch.bool, device=device)
 
-        # 1. Bayesian update → PCA posterior
-        mu_c, var_c = self.bayesian_update(wavelength, fwhm, radiance, pad_mask)
+        # --- Stage 1: Bayesian update (flatten over pixels) ---
+        flat_wl = wavelength.reshape(B * K, N)
+        flat_fw = fwhm.reshape(B * K, N)
+        flat_rad = radiance.reshape(B * K, N)
+        flat_mask = pad_mask.reshape(B * K, N)
 
-        # 2. Encode → latent distribution
-        mu_z, log_var_z = self.encode(mu_c, var_c)
-        z = self.reparameterize(mu_z, log_var_z)
+        mu_c_flat, var_c_flat = self.bayesian_update(
+            flat_wl, flat_fw, flat_rad, flat_mask,
+        )
+        n_pca_rad = self.config.n_pca_radiance
+        pca_mu = mu_c_flat.view(B, K, n_pca_rad)
+        pca_var = var_c_flat.view(B, K, n_pca_rad)
 
-        # 3. Decode → task outputs
-        reflectance = self.decode_reflectance(z)
-        atmos_mu, atmos_log_var = self.decode_atmosphere(z)
-        temp_mu, temp_log_var = self.decode_temperature(z)
+        # --- Stage 2: per-pixel features ---
+        h = self._encode_pixels(pca_mu, pca_var)              # (B, K, feat)
+
+        # --- Atmospheric fusion across pixels ---
+        mu_atm, log_var_atm = self._fuse_atmosphere(h, pixel_mask)
+        z_atm = self.reparameterize(mu_atm, log_var_atm)      # (B, z_atm)
+
+        # --- Per-pixel surface latent, conditioned on z_atm ---
+        mu_surf, log_var_surf = self._encode_surface(h, z_atm)
+        z_surf = self.reparameterize(mu_surf, log_var_surf)   # (B, K, z_surf)
+
+        # --- Task heads ---
+        # Reflectance: per-pixel linear PCA reconstruction
+        refl_coeffs = self.reflectance_head(z_surf)           # (B, K, n_pca_refl)
+        reflectance = torch.matmul(
+            refl_coeffs, self.refl_pca_components,
+        ) + self.refl_pca_mean                                # (B, K, W)
+        reflectance = reflectance.clamp(0.0, 1.0)
+
+        # Per-pixel temperature
+        temp_out = self.temperature_head(z_surf)              # (B, K, 2)
+        temp_mu, temp_log_var = temp_out.chunk(2, dim=-1)
+        temp_log_var = temp_log_var.clamp(-7.0, 4.0)
+
+        # Per-pixel material logits
+        material_logits = self.material_head(z_surf)          # (B, K, n_classes)
+
+        # Scene-shared atmospheric parameters
+        atm_out = self.atmosphere_head(z_atm)                 # (B, 2*n_atmos)
+        atmos_mu, atmos_log_var = atm_out.chunk(2, dim=-1)
+        atmos_log_var = atmos_log_var.clamp(-7.0, 4.0)
+
+        # Physics consistency: joint (z_atm, z_surf) → radiance PCA coeffs
+        # The head outputs NORMALIZED coefficients (in units of prior std)
+        # for a well-scaled loss.  Real coefficients: pred_norm · prior_std.
+        z_atm_bcast = z_atm.unsqueeze(1).expand(-1, K, -1)
+        phys_in = torch.cat([z_atm_bcast, z_surf], dim=-1)
+        rad_coeffs_normed = self.physics_head(phys_in)        # (B, K, n_pca_rad)
+        prior_std = (self.rad_pca_variances + 1e-10).sqrt()
+        rad_coeffs_recon = rad_coeffs_normed * prior_std
+        radiance_recon = torch.matmul(
+            rad_coeffs_recon, self.rad_pca_components,
+        ) + self.rad_pca_mean                                 # (B, K, W)
 
         return FoundationOutput(
             reflectance=reflectance,
-            atmos_mu=atmos_mu,
-            atmos_log_var=atmos_log_var,
+            radiance_recon=radiance_recon,
+            rad_coeffs_normed=rad_coeffs_normed,
             temp_mu=temp_mu,
             temp_log_var=temp_log_var,
-            z=z,
-            z_mu=mu_z,
-            z_log_var=log_var_z,
-            pca_mu=mu_c,
-            pca_var=var_c,
+            material_logits=material_logits,
+            atmos_mu=atmos_mu,
+            atmos_log_var=atmos_log_var,
+            z_atm=z_atm,
+            z_atm_mu=mu_atm,
+            z_atm_log_var=log_var_atm,
+            z_surf=z_surf,
+            z_surf_mu=mu_surf,
+            z_surf_log_var=log_var_surf,
+            pca_mu=pca_mu,
+            pca_var=pca_var,
+            pixel_mask=pixel_mask,
         )
 
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
 
-    @staticmethod
     def loss(
+        self,
         output: FoundationOutput,
-        target_reflectance: Tensor,
-        target_atmos: Tensor,
-        target_temperature: Tensor,
-        beta: float = 1.0,
-        w_refl: float = 1.0,
-        w_atmos: float = 1.0,
-        w_temp: float = 1.0,
+        target_reflectance: Tensor,       # (B, K, W) or (B, W)
+        target_radiance: Tensor,          # (B, K, W) or (B, W)
+        target_atmos: Tensor,             # (B, n_atmos)
+        target_temperature: Tensor,       # (B, K, 1) or (B, 1)
+        target_material: Tensor | None = None,  # (B, K) or (B,) long
     ) -> dict[str, Tensor]:
-        """Compute combined training loss.
+        """Multi-task loss with physics consistency.
 
-        Parameters
-        ----------
-        target_reflectance : (B, W) surface reflectance on dense grid
-        target_atmos       : (B, n_atmos) normalised atmospheric parameters
-        target_temperature : (B, 1) normalised surface temperature
-        beta               : KL weight
-        w_refl, w_atmos, w_temp : task loss weights
+        All per-pixel tensors are internally reshaped to (B, K, ...) to
+        match the model's output.
         """
-        # --- Reflectance reconstruction (MSE) ---
-        refl_loss = torch.nn.functional.mse_loss(
-            output.reflectance, target_reflectance,
-        )
+        c = self.config
+        pixel_mask = output.pixel_mask                        # (B, K)
+        mask_f = pixel_mask.float()
+        n_valid = mask_f.sum().clamp(min=1.0)
 
-        # --- Atmosphere (Gaussian NLL, heteroscedastic) ---
-        atmos_nll = 0.5 * (
-            output.atmos_log_var
-            + (target_atmos - output.atmos_mu) ** 2 / output.atmos_log_var.exp()
-        )
-        atmos_loss = atmos_nll.mean()
+        # Ensure per-pixel targets have K dim
+        def _maybe_unsqueeze(t: Tensor) -> Tensor:
+            return t.unsqueeze(1) if t.dim() == output.reflectance.dim() - 1 else t
 
-        # --- Temperature (Gaussian NLL, heteroscedastic) ---
-        temp_nll = 0.5 * (
-            output.temp_log_var
-            + (target_temperature - output.temp_mu) ** 2 / output.temp_log_var.exp()
-        )
-        temp_loss = temp_nll.mean()
+        target_reflectance = _maybe_unsqueeze(target_reflectance)
+        target_radiance = _maybe_unsqueeze(target_radiance)
+        target_temperature = _maybe_unsqueeze(target_temperature)
 
-        # --- KL divergence: q(z|x) || N(0, I) ---
-        kl = -0.5 * (
-            1.0 + output.z_log_var - output.z_mu.pow(2) - output.z_log_var.exp()
-        )
-        kl_loss = kl.sum(dim=-1).mean()
+        # ---- Reflectance (MSE per wavelength, masked by pixel) ----
+        refl_err = (output.reflectance - target_reflectance) ** 2    # (B, K, W)
+        refl_loss = (refl_err.mean(dim=-1) * mask_f).sum() / n_valid
 
-        total = w_refl * refl_loss + w_atmos * atmos_loss + w_temp * temp_loss + beta * kl_loss
+        # ---- Physics consistency (in normalized PCA-coefficient space) ----
+        # Project the target radiance into normalized PCA space so the loss
+        # is in units of "squared prior std" and scale-matched to the other
+        # per-pixel losses.
+        prior_std = (self.rad_pca_variances + 1e-10).sqrt()
+        centered = target_radiance - self.rad_pca_mean                # (B, K, W)
+        target_coeffs_normed = torch.matmul(
+            centered, self.rad_pca_components.T,
+        ) / prior_std                                                 # (B, K, n_pca)
+        phys_err = (output.rad_coeffs_normed - target_coeffs_normed) ** 2
+        phys_loss = (phys_err.mean(dim=-1) * mask_f).sum() / n_valid
+
+        # ---- Atmosphere: scene-shared Gaussian NLL ----
+        atm_err_sq = (target_atmos - output.atmos_mu) ** 2
+        atm_nll = 0.5 * (output.atmos_log_var + atm_err_sq / output.atmos_log_var.exp())
+        atm_loss = atm_nll.mean()
+
+        # ---- Temperature: per-pixel Gaussian NLL ----
+        temp_err_sq = (target_temperature - output.temp_mu) ** 2
+        temp_nll = 0.5 * (output.temp_log_var + temp_err_sq / output.temp_log_var.exp())
+        temp_nll = temp_nll.squeeze(-1)                              # (B, K)
+        temp_loss = (temp_nll * mask_f).sum() / n_valid
+
+        # ---- Material (optional): per-pixel cross-entropy ----
+        if target_material is not None and c.w_material > 0:
+            target_material = _maybe_unsqueeze(
+                target_material.unsqueeze(-1)
+            ).squeeze(-1) if target_material.dim() == 1 else target_material
+            B, K, C = output.material_logits.shape
+            ce = F.cross_entropy(
+                output.material_logits.reshape(B * K, C),
+                target_material.reshape(B * K).long(),
+                reduction="none",
+            ).view(B, K)
+            mat_loss = (ce * mask_f).sum() / n_valid
+        else:
+            mat_loss = torch.tensor(0.0, device=output.reflectance.device)
+
+        # ---- KL divergences ----
+        kl_atm = _gaussian_kl_standard(output.z_atm_mu, output.z_atm_log_var).mean()
+        kl_surf_per = _gaussian_kl_standard(output.z_surf_mu, output.z_surf_log_var)
+        kl_surf = (kl_surf_per * mask_f).sum() / n_valid
+
+        total = (
+            c.w_refl * refl_loss
+            + c.w_physics * phys_loss
+            + c.w_atmos * atm_loss
+            + c.w_temp * temp_loss
+            + c.w_material * mat_loss
+            + c.beta_atm * kl_atm
+            + c.beta_surf * kl_surf
+        )
 
         return {
             "total": total,
             "reflectance": refl_loss.detach(),
-            "atmosphere": atmos_loss.detach(),
+            "physics": phys_loss.detach(),
+            "atmosphere": atm_loss.detach(),
             "temperature": temp_loss.detach(),
-            "kl": kl_loss.detach(),
+            "material": mat_loss.detach(),
+            "kl_atm": kl_atm.detach(),
+            "kl_surf": kl_surf.detach(),
         }

@@ -1,4 +1,9 @@
-"""Training script for the Bayesian-PCA spectral foundation model.
+"""Training script for the disentangled spectral foundation model.
+
+The model uses a multi-pixel architecture internally — today it trains
+with K=1 (one pixel per scene) by wrapping every dataset sample in a
+K=1 dimension, but the architecture is already set up to handle
+multi-pixel scenes without any model changes.
 
 Usage:
     # Quick test with synthetic spectra (no external data):
@@ -8,19 +13,11 @@ Usage:
     python -m spectralnp.training.train_foundation \
         --usgs-data /path/to/ASCIIdata_splib07a \
         --epochs 100 --samples-per-epoch 5000
-
-    # With ARTS simulator:
-    python -m spectralnp.training.train_foundation \
-        --usgs-data /path/to/ASCIIdata_splib07a \
-        --arts-lut ~/.cache/atmgen/lut/abs_lookup_fa72fc35f64b.xml \
-        --epochs 100
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 import time
 from pathlib import Path
 
@@ -87,6 +84,7 @@ def train(args: argparse.Namespace) -> None:
         n_bands_range=(3, 200),
         seed=args.seed,
     )
+    n_material_classes = dataset.n_material_classes
 
     loader = DataLoader(
         dataset,
@@ -103,18 +101,36 @@ def train(args: argparse.Namespace) -> None:
     config = FoundationConfig(
         n_pca_radiance=args.n_pca,
         n_pca_reflectance=args.n_pca,
-        z_dim=args.z_dim,
-        beta=args.beta,
+        z_atm_dim=args.z_atm_dim,
+        z_surf_dim=args.z_surf_dim,
+        feature_dim=args.feature_dim,
+        n_material_classes=n_material_classes,
         dropout=args.dropout,
+        w_refl=args.w_refl,
+        w_atmos=args.w_atmos,
+        w_temp=args.w_temp,
+        w_material=args.w_material,
+        w_physics=args.w_physics,
+        beta_atm=args.beta_atm,
+        beta_surf=args.beta_surf,
     )
 
     model = SpectralFoundation(config).to(device)
     diag = model.fit_pca(rad_spectra, refl_spectra, dense_wl)
-    print(f"Radiance  PCA: {diag['radiance_explained_var']:.1%} variance explained ({args.n_pca} components)")
-    print(f"Reflectance PCA: {diag['reflectance_explained_var']:.1%} variance explained ({args.n_pca} components)")
+    ev_rad = float(diag["radiance_explained_var"])
+    ev_refl = float(diag["reflectance_explained_var"])
+    print(
+        f"Radiance    PCA: {ev_rad * 100:.4f}% variance explained "
+        f"({model.config.n_pca_radiance} components)"
+    )
+    print(
+        f"Reflectance PCA: {ev_refl * 100:.4f}% variance explained "
+        f"({model.config.n_pca_reflectance} components)"
+    )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
+    print(f"Material classes: {n_material_classes}")
 
     # ---- Optimiser ----
     optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -138,15 +154,22 @@ def train(args: argparse.Namespace) -> None:
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        epoch_losses = {k: 0.0 for k in ["total", "reflectance", "atmosphere", "temperature", "kl"]}
+        epoch_losses = {
+            k: 0.0 for k in
+            ["total", "reflectance", "physics", "atmosphere",
+             "temperature", "material", "kl_atm", "kl_surf"]
+        }
         n_batches = 0
         t0 = time.time()
 
-        # Beta warmup: linear over first beta_warmup epochs
+        # KL annealing: linearly ramp beta_atm and beta_surf
         if args.beta_warmup > 0 and epoch <= args.beta_warmup:
-            beta = args.beta * epoch / args.beta_warmup
+            warm = epoch / args.beta_warmup
+            model.config.beta_atm = args.beta_atm * warm
+            model.config.beta_surf = args.beta_surf * warm
         else:
-            beta = args.beta
+            model.config.beta_atm = args.beta_atm
+            model.config.beta_surf = args.beta_surf
 
         for batch in loader:
             wl = batch["wavelength"].to(device)
@@ -154,22 +177,22 @@ def train(args: argparse.Namespace) -> None:
             rad = batch["radiance"].to(device)
             mask = batch["pad_mask"].to(device)
             target_refl = batch["target_reflectance"].to(device)
+            target_rad = batch["target_radiance"].to(device)
             target_atmos = batch["atmos_params"].to(device)
-            target_temp = batch["surface_temperature_k"].to(device)
+            target_temp_k = batch["surface_temperature_k"].to(device)
+            target_material = batch["material_idx"].to(device)
 
             # Normalise temperature: (T - 290) / 40 → roughly [-1, 1]
-            target_temp_norm = ((target_temp - 290.0) / 40.0).unsqueeze(-1)
+            target_temp_norm = ((target_temp_k - 290.0) / 40.0).unsqueeze(-1)
 
             output = model(wl, fw, rad, mask)
-            losses = SpectralFoundation.loss(
+            losses = model.loss(
                 output,
-                target_refl,
-                target_atmos,
-                target_temp_norm,
-                beta=beta,
-                w_refl=args.w_refl,
-                w_atmos=args.w_atmos,
-                w_temp=args.w_temp,
+                target_reflectance=target_refl,
+                target_radiance=target_rad,
+                target_atmos=target_atmos,
+                target_temperature=target_temp_norm,
+                target_material=target_material,
             )
 
             optimiser.zero_grad()
@@ -191,12 +214,16 @@ def train(args: argparse.Namespace) -> None:
 
         line = (
             f"[{epoch:4d}/{args.epochs}]  "
-            f"loss={avg['total']:.4f}  "
+            f"tot={avg['total']:7.3f}  "
             f"refl={avg['reflectance']:.4f}  "
-            f"atm={avg['atmosphere']:.4f}  "
-            f"temp={avg['temperature']:.4f}  "
-            f"kl={avg['kl']:.2f}  "
-            f"β={beta:.4f}  lr={lr:.2e}  "
+            f"phys={avg['physics']:7.3f}  "
+            f"atm={avg['atmosphere']:.3f}  "
+            f"temp={avg['temperature']:.3f}  "
+            f"mat={avg['material']:.3f}  "
+            f"klA={avg['kl_atm']:.2f}  "
+            f"klS={avg['kl_surf']:.2f}  "
+            f"β_a={model.config.beta_atm:.3f}  "
+            f"lr={lr:.2e}  "
             f"{dt:.1f}s"
         )
         print(line)
@@ -206,12 +233,14 @@ def train(args: argparse.Namespace) -> None:
         if args.wandb:
             import wandb
             wandb.log({f"train/{k}": v for k, v in avg.items()}, step=epoch)
-            wandb.log({"train/beta": beta, "train/lr": lr}, step=epoch)
+            wandb.log({"train/lr": lr, "train/beta_atm": model.config.beta_atm},
+                       step=epoch)
 
         # ---- Checkpointing ----
         if avg["total"] < best_loss:
             best_loss = avg["total"]
-            _save_checkpoint(model, config, dense_wl, optimiser, epoch, output_dir / "best.pt")
+            _save_checkpoint(model, config, dense_wl, optimiser, epoch,
+                             output_dir / "best.pt")
 
         if epoch % max(args.epochs // 5, 1) == 0 or epoch == args.epochs:
             _save_checkpoint(
@@ -219,8 +248,8 @@ def train(args: argparse.Namespace) -> None:
                 output_dir / f"epoch_{epoch:04d}.pt",
             )
 
-    # ---- Final checkpoint ----
-    _save_checkpoint(model, config, dense_wl, optimiser, args.epochs, output_dir / "final.pt")
+    _save_checkpoint(model, config, dense_wl, optimiser, args.epochs,
+                     output_dir / "final.pt")
     print(f"\nTraining complete. Checkpoints saved to {output_dir}")
 
 
@@ -245,34 +274,36 @@ def _save_checkpoint(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Train spectral foundation model")
+    p = argparse.ArgumentParser(description="Train disentangled spectral foundation")
 
     # Data
-    p.add_argument("--usgs-data", type=str, default=None,
-                    help="Path to USGS ASCIIdata_splib07a directory")
+    p.add_argument("--usgs-data", type=str, default=None)
     p.add_argument("--samples-per-epoch", type=int, default=5000)
-    p.add_argument("--n-pca-samples", type=int, default=5000,
-                    help="Number of samples to collect for PCA fitting")
+    p.add_argument("--n-pca-samples", type=int, default=5000)
 
-    # Model
-    p.add_argument("--n-pca", type=int, default=64)
-    p.add_argument("--z-dim", type=int, default=128)
+    # Model sizes
+    p.add_argument("--n-pca", type=int, default=0,
+                    help="PCA components (0 = full rank, recommended)")
+    p.add_argument("--z-atm-dim", type=int, default=32)
+    p.add_argument("--z-surf-dim", type=int, default=96)
+    p.add_argument("--feature-dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.1)
+
+    # Loss weights
+    p.add_argument("--w-refl", type=float, default=1.0)
+    p.add_argument("--w-atmos", type=float, default=1.0)
+    p.add_argument("--w-temp", type=float, default=1.0)
+    p.add_argument("--w-material", type=float, default=0.1)
+    p.add_argument("--w-physics", type=float, default=0.5)
+    p.add_argument("--beta-atm", type=float, default=0.01)
+    p.add_argument("--beta-surf", type=float, default=0.01)
+    p.add_argument("--beta-warmup", type=int, default=10)
 
     # Training
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--lr-constant", action="store_true")
-    p.add_argument("--beta", type=float, default=0.01,
-                    help="KL weight (keep low for sharp reconstructions)")
-    p.add_argument("--beta-warmup", type=int, default=10,
-                    help="Linear beta warmup epochs")
-
-    # Loss weights
-    p.add_argument("--w-refl", type=float, default=1.0)
-    p.add_argument("--w-atmos", type=float, default=0.1)
-    p.add_argument("--w-temp", type=float, default=0.1)
 
     # Infrastructure
     p.add_argument("--output-dir", type=str, default="checkpoints/foundation")
@@ -282,7 +313,6 @@ def main() -> None:
 
     args = p.parse_args()
 
-    # Auto-detect MPS/CUDA
     if args.device == "cpu":
         if torch.cuda.is_available():
             args.device = "cuda"
@@ -290,7 +320,10 @@ def main() -> None:
             args.device = "mps"
 
     print(f"Device: {args.device}")
-    print(f"Config: z_dim={args.z_dim}, n_pca={args.n_pca}, beta={args.beta}")
+    print(
+        f"Config: z_atm={args.z_atm_dim}, z_surf={args.z_surf_dim}, "
+        f"feat={args.feature_dim}, β_atm={args.beta_atm}"
+    )
 
     train(args)
 
