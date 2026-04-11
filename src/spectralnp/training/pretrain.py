@@ -181,15 +181,13 @@ def train_one_epoch(
         # In pretraining, we pass the dense spectrum through a second
         # encode call to get the full-information posterior.
         with torch.no_grad():
-            # Approximate: use target radiance at dense wavelengths as "all bands".
-            # For efficiency, subsample to ~50 query points.
-            n_dense = target_wl.shape[1]
-            subsample = torch.randperm(n_dense, device=device)[:50].sort().values
-            dense_wl_sub = target_wl[:, subsample]
-            dense_fwhm_sub = torch.ones_like(dense_wl_sub) * 5.0  # narrow bands
-            dense_rad_sub = target_rad[:, subsample]
+            # Target posterior: encode ALL dense grid points as "full information".
+            # This must be strictly more informative than the context (input bands)
+            # so the KL loss incentivizes the encoder to extract more detail
+            # when given more bands.
+            dense_fwhm = torch.ones_like(target_wl) * 1.0  # 1nm FWHM (near-delta)
             _, _, _, _, _, prior_mu, prior_log_sigma = model.encode(
-                dense_wl_sub, dense_fwhm_sub, dense_rad_sub
+                target_wl, dense_fwhm, target_rad
             )
 
         # Override KL weight for annealing.

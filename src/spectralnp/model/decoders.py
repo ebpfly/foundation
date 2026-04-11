@@ -138,30 +138,43 @@ class GridDecoder(nn.Module):
         n_grid: int = 425,
         hidden_channels: int = 128,
         n_blocks: int = 4,
-        dropout: float = 0.1,
+        dropout: float = 0.05,
     ) -> None:
         super().__init__()
         self.n_grid = n_grid
 
         # Project z to a spatial feature map: (B, z_dim) → (B, C, L_init)
-        # Start with a small spatial dimension and upsample.
         self.l_init = max(n_grid // 8, 16)
         self.proj = nn.Linear(z_dim, hidden_channels * self.l_init)
         self.z_drop = nn.Dropout(dropout)
 
-        # Residual 1D conv blocks with increasing resolution.
-        blocks: list[nn.Module] = []
-        for _ in range(n_blocks):
-            blocks.append(_ResConvBlock(hidden_channels, dropout))
-        self.blocks = nn.Sequential(*blocks)
+        # Progressive upsampling: interleave conv blocks with 2× upsamples
+        # so each block operates at increasing resolution.
+        # 53 → 106 → 212 → 425 (3 upsamples for 4 blocks)
+        self.stages = nn.ModuleList()
+        self.upsamples = nn.ModuleList()
+        sizes = [self.l_init]
+        for i in range(n_blocks):
+            self.stages.append(_ResConvBlock(hidden_channels, dropout))
+            if i < n_blocks - 1:
+                next_size = min(sizes[-1] * 2, n_grid)
+                self.upsamples.append(
+                    nn.Upsample(size=next_size, mode="linear", align_corners=False)
+                )
+                sizes.append(next_size)
+        # Final upsample to exact grid size.
+        self.final_upsample = nn.Upsample(size=n_grid, mode="linear", align_corners=False)
 
-        # Upsample to target grid size, then final projection.
-        self.upsample = nn.Upsample(size=n_grid, mode="linear", align_corners=False)
-        # Output: 2 channels (mu, log_var) per grid point.
-        self.head = nn.Sequential(
+        # Separate heads for mu and log_var so they don't compete for capacity.
+        self.mu_head = nn.Sequential(
             nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv1d(hidden_channels, 2, kernel_size=1),
+            nn.Conv1d(hidden_channels, 1, kernel_size=1),
+        )
+        self.logvar_head = nn.Sequential(
+            nn.Conv1d(hidden_channels, hidden_channels // 4, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(hidden_channels // 4, 1, kernel_size=1),
         )
 
     def forward(
@@ -187,29 +200,31 @@ class GridDecoder(nn.Module):
         """
         B = z.shape[0]
         h = self.z_drop(self.proj(z)).reshape(B, -1, self.l_init)  # (B, C, L_init)
-        h = self.blocks(h)
-        h = self.upsample(h)  # (B, C, n_grid)
-        out = self.head(h)    # (B, 2, n_grid)
-        mu = out[:, 0, :]      # (B, n_grid)
-        log_var = out[:, 1, :] # (B, n_grid)
+        for i, stage in enumerate(self.stages):
+            h = stage(h)
+            if i < len(self.upsamples):
+                h = self.upsamples[i](h)
+        h = self.final_upsample(h)  # (B, C, n_grid)
+        mu = self.mu_head(h).squeeze(1)          # (B, n_grid)
+        log_var = self.logvar_head(h).squeeze(1)  # (B, n_grid)
         return mu, log_var
 
 
 class _ResConvBlock(nn.Module):
-    """Residual 1D conv block: conv → GELU → dropout → conv + skip."""
+    """Pre-norm residual 1D conv block: norm → conv → GELU → conv + skip."""
 
     def __init__(self, channels: int, dropout: float = 0.0) -> None:
         super().__init__()
+        self.norm = nn.GroupNorm(8, channels)
         self.net = nn.Sequential(
             nn.Conv1d(channels, channels, kernel_size=5, padding=2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Conv1d(channels, channels, kernel_size=5, padding=2),
         )
-        self.norm = nn.GroupNorm(8, channels)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.norm(x + self.net(x))
+        return x + self.net(self.norm(x))
 
 
 class MaterialDecoder(nn.Module):

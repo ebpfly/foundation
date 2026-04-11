@@ -108,23 +108,13 @@ def np_kl_divergence(
     z_log_sigma: Tensor,
     prior_mu: Tensor | None = None,
     prior_log_sigma: Tensor | None = None,
-    log_sigma_min: float = -2.0,
-    log_sigma_max: float = 2.0,
-    free_bits: float = 0.05,
+    free_bits: float = 0.1,
 ) -> Tensor:
     """KL divergence between the context posterior and a prior.
 
     For self-supervised pretraining, the prior is the posterior conditioned
     on ALL bands (the "target" posterior). During inference, we use a
     standard normal prior.
-
-    Stability:
-      - log_sigma is clamped to ``[log_sigma_min, log_sigma_max]`` to
-        prevent the KL from blowing up when the prior is overconfident
-        (small sigma_p) or the context posterior collapses
-      - "free bits": per-dimension KL is floored at ``free_bits``, which
-        prevents the latent from collapsing into the prior (deactivates
-        the dimension)
 
     KL(q(z|context) || p(z)) where both are diagonal Gaussians.
     """
@@ -133,11 +123,8 @@ def np_kl_divergence(
         prior_mu = torch.zeros_like(z_mu)
         prior_log_sigma = torch.zeros_like(z_log_sigma)
 
-    # Clamp for stability — prevents the formula from exploding when
-    # sigma_p is very small (overconfident prior) or sigma_q is huge.
-    z_log_sigma = z_log_sigma.clamp(log_sigma_min, log_sigma_max)
-    prior_log_sigma = prior_log_sigma.clamp(log_sigma_min, log_sigma_max)
-
+    # No clamping — let the KL see the actual posterior precision.
+    # The encoder's own clamp (spectral_aggregator.py) handles stability.
     sigma_q_sq = (2 * z_log_sigma).exp()
     sigma_p_sq = (2 * prior_log_sigma).exp()
 
@@ -146,13 +133,10 @@ def np_kl_divergence(
         + (sigma_q_sq + (z_mu - prior_mu) ** 2) / (2 * sigma_p_sq)
         - 0.5
     )
-    # Free bits: floor each dimension's KL at `free_bits`, sum over dims.
-    kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
-    kl_total = kl_per_dim.sum(dim=-1).mean()
-    # Soft ceiling: log(1 + KL) keeps gradient flowing for any KL value
-    # but prevents the absolute scale from dominating the total loss when
-    # KL is large (e.g. early training, before posteriors align).
-    return torch.log1p(kl_total)
+    # Free bits: allow this much KL per dimension without penalty.
+    kl_per_dim = torch.clamp(kl_per_dim - free_bits, min=0.0)
+    # Return raw KL (no log1p compression — let w_kl control scale).
+    return kl_per_dim.sum(dim=-1).mean()
 
 
 def atmospheric_loss(
