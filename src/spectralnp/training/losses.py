@@ -108,7 +108,7 @@ def np_kl_divergence(
     z_log_sigma: Tensor,
     prior_mu: Tensor | None = None,
     prior_log_sigma: Tensor | None = None,
-    free_bits: float = 0.1,
+    free_bits: float = 0.0,
 ) -> Tensor:
     """KL divergence between the context posterior and a prior.
 

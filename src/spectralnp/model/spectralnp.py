@@ -103,6 +103,21 @@ class SpectralNP(nn.Module):
 
         z_total = cfg.z_atm_dim + cfg.z_surf_dim
 
+        # Direct target encoder: maps ground-truth spectrum to z without
+        # going through the attention bottleneck. Used for the KL target
+        # posterior during training. This gives a strictly more informative
+        # target than the context encoder can achieve.
+        if cfg.use_grid_decoder:
+            grid_n = cfg.grid_n_points
+            self.target_encoder = nn.Sequential(
+                nn.Linear(grid_n, 1024),
+                nn.GELU(),
+                nn.Linear(1024, 1024),
+                nn.GELU(),
+            )
+            self.target_to_mu = nn.Linear(1024, z_total)
+            self.target_to_log_sigma = nn.Linear(1024, z_total)
+
         self.encoder = BandEncoder(cfg.d_model, cfg.n_frequencies)
         self.aggregator = SpectralAggregator(
             d_model=cfg.d_model,
@@ -186,6 +201,26 @@ class SpectralNP(nn.Module):
         model.load_state_dict(filtered, strict=False)
         model.eval()
         return model
+
+    def encode_target(self, target_spectrum: Tensor) -> tuple[Tensor, Tensor]:
+        """Encode ground-truth spectrum directly to z (bypass attention bottleneck).
+
+        Used for the KL target posterior during training. This gives a strictly
+        more informative target than the context encoder can produce.
+
+        Parameters
+        ----------
+        target_spectrum : Tensor[B, grid_n_points]
+            Ground-truth dense spectrum (radiance or reflectance).
+
+        Returns
+        -------
+        z_mu, z_log_sigma : Tensor[B, z_total]
+        """
+        h = self.target_encoder(target_spectrum)
+        mu = self.target_to_mu(h)
+        log_sigma = self.target_to_log_sigma(h).clamp(-6.0, 2.0)
+        return mu, log_sigma
 
     def _reparameterise(self, mu: Tensor, log_sigma: Tensor) -> Tensor:
         """Sample z via the reparameterisation trick."""
