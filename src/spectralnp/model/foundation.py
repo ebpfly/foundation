@@ -83,8 +83,6 @@ class FoundationConfig:
     w_temp: float = 1.0
     w_material: float = 0.0   # disabled by default — enable once classes are set
     w_physics: float = 0.5
-    beta_atm: float = 1.0     # KL weight for z_atm
-    beta_surf: float = 1.0    # KL weight for z_surf
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +110,9 @@ class FoundationOutput:
     atmos_mu: Tensor              # (B, n_atmos)
     atmos_log_var: Tensor         # (B, n_atmos)
 
-    # --- Latents ---
+    # --- Latents (deterministic — uncertainty comes from PCA sampling) ---
     z_atm: Tensor                 # (B, z_atm_dim)
-    z_atm_mu: Tensor              # (B, z_atm_dim)
-    z_atm_log_var: Tensor         # (B, z_atm_dim)
-
     z_surf: Tensor                # (B, K, z_surf_dim)
-    z_surf_mu: Tensor             # (B, K, z_surf_dim)
-    z_surf_log_var: Tensor        # (B, K, z_surf_dim)
 
     # --- Stage-1 diagnostics (per pixel) ---
     pca_mu: Tensor                # (B, K, n_pca_rad)
@@ -159,11 +152,6 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
-
-
-def _gaussian_kl_standard(mu: Tensor, log_var: Tensor) -> Tensor:
-    """KL( N(μ, σ²) || N(0, I) ), summed over the last dim."""
-    return -0.5 * (1.0 + log_var - mu.pow(2) - log_var.exp()).sum(dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +206,11 @@ class SpectralFoundation(nn.Module):
             dropout=c.dropout,
         )
 
-        # Surface trunk: [h_i, z_atm] → (μ_surf, log_var_surf)
+        # Surface trunk: [h_i, z_atm] → z_surf  (deterministic)
         self.surf_trunk = MLP(
             in_dim=c.feature_dim + c.z_atm_dim,
             hidden_dims=c.head_hidden,
-            out_dim=2 * c.z_surf_dim,
+            out_dim=c.z_surf_dim,
             dropout=c.dropout,
         )
 
@@ -557,23 +545,20 @@ class SpectralFoundation(nn.Module):
         self,
         h: Tensor,                  # (B, K, feature_dim)
         pixel_mask: Tensor,         # (B, K) bool
-    ) -> tuple[Tensor, Tensor]:
+    ) -> Tensor:
         """Gaussian-product fusion of per-pixel atmospheric pseudo-observations.
 
-        Each pixel i produces a Gaussian belief (μ_i, σ²_i) about z_atm.
-        The combined posterior is N(μ, σ²) with
+        Each pixel i produces a point estimate μ_i and a learned precision
+        weight (via log_var_i).  The fused z_atm is the precision-weighted
+        mean — deterministic given h.
 
-            precision_i  = 1 / σ²_i     (masked by pixel_mask)
-            σ²           = 1 / Σ_i precision_i
-            μ            = σ² · Σ_i μ_i precision_i
-
-        With K=1 this degrades to the single pixel's belief.  With K>>1
-        the precision sums and the posterior tightens by √K (in the
-        homoscedastic limit).
+        Uncertainty comes from PCA posterior sampling at the input, NOT
+        from sampling z_atm.  The precision weights just control how
+        much each pixel's estimate contributes to the scene-level
+        atmospheric state.
         """
         out = self.atm_pseudo_head(h)                         # (B, K, 2*z_atm)
         mu_i, log_var_i = out.chunk(2, dim=-1)
-        # Clamp log_var for stability
         log_var_i = log_var_i.clamp(-10.0, 10.0)
 
         prec_i = (-log_var_i).exp()                           # (B, K, z_atm)
@@ -581,30 +566,23 @@ class SpectralFoundation(nn.Module):
         prec_i = prec_i * mask_f
 
         prec_sum = prec_i.sum(dim=1) + 1e-10                  # (B, z_atm)
-        mu_atm = (mu_i * prec_i).sum(dim=1) / prec_sum        # (B, z_atm)
-        log_var_atm = -torch.log(prec_sum)                    # (B, z_atm)
-        return mu_atm, log_var_atm
+        z_atm = (mu_i * prec_i).sum(dim=1) / prec_sum         # (B, z_atm)
+        return z_atm
 
     def _encode_surface(
         self,
         h: Tensor,          # (B, K, feature_dim)
         z_atm: Tensor,      # (B, z_atm_dim)
-    ) -> tuple[Tensor, Tensor]:
-        """Per-pixel surface latent, conditioned on the shared atmosphere."""
+    ) -> Tensor:
+        """Per-pixel surface latent, conditioned on the shared atmosphere.
+
+        Deterministic — uncertainty comes from PCA posterior sampling
+        at the input, not from latent sampling.
+        """
         B, K, _ = h.shape
         z_atm_bcast = z_atm.unsqueeze(1).expand(-1, K, -1)
         x = torch.cat([h, z_atm_bcast], dim=-1)               # (B, K, feat+z_atm)
-        out = self.surf_trunk(x)                              # (B, K, 2*z_surf)
-        mu_surf, log_var_surf = out.chunk(2, dim=-1)
-        return mu_surf, log_var_surf.clamp(-10.0, 10.0)
-
-    @staticmethod
-    def reparameterize(mu: Tensor, log_var: Tensor) -> Tensor:
-        """Sample with the reparameterization trick.  Always samples
-        (including at eval time) so that MC inference over multiple
-        forward passes gives calibrated uncertainty."""
-        std = (0.5 * log_var).exp()
-        return mu + std * torch.randn_like(std)
+        return self.surf_trunk(x)                              # (B, K, z_surf)
 
     # ------------------------------------------------------------------
     # Forward
@@ -654,13 +632,11 @@ class SpectralFoundation(nn.Module):
         # --- Stage 2: per-pixel features ---
         h = self._encode_pixels(pca_mu, pca_var)              # (B, K, feat)
 
-        # --- Atmospheric fusion across pixels ---
-        mu_atm, log_var_atm = self._fuse_atmosphere(h, pixel_mask)
-        z_atm = self.reparameterize(mu_atm, log_var_atm)      # (B, z_atm)
+        # --- Atmospheric fusion across pixels (deterministic) ---
+        z_atm = self._fuse_atmosphere(h, pixel_mask)           # (B, z_atm)
 
-        # --- Per-pixel surface latent, conditioned on z_atm ---
-        mu_surf, log_var_surf = self._encode_surface(h, z_atm)
-        z_surf = self.reparameterize(mu_surf, log_var_surf)   # (B, K, z_surf)
+        # --- Per-pixel surface latent (deterministic, conditioned on z_atm) ---
+        z_surf = self._encode_surface(h, z_atm)               # (B, K, z_surf)
 
         # --- Task heads ---
         # Reflectance: per-pixel linear PCA reconstruction
@@ -705,11 +681,7 @@ class SpectralFoundation(nn.Module):
             atmos_mu=atmos_mu,
             atmos_log_var=atmos_log_var,
             z_atm=z_atm,
-            z_atm_mu=mu_atm,
-            z_atm_log_var=log_var_atm,
             z_surf=z_surf,
-            z_surf_mu=mu_surf,
-            z_surf_log_var=log_var_surf,
             pca_mu=pca_mu,
             pca_var=pca_var,
             pixel_mask=pixel_mask,
@@ -788,19 +760,12 @@ class SpectralFoundation(nn.Module):
         else:
             mat_loss = torch.tensor(0.0, device=output.reflectance.device)
 
-        # ---- KL divergences ----
-        kl_atm = _gaussian_kl_standard(output.z_atm_mu, output.z_atm_log_var).mean()
-        kl_surf_per = _gaussian_kl_standard(output.z_surf_mu, output.z_surf_log_var)
-        kl_surf = (kl_surf_per * mask_f).sum() / n_valid
-
         total = (
             c.w_refl * refl_loss
             + c.w_physics * phys_loss
             + c.w_atmos * atm_loss
             + c.w_temp * temp_loss
             + c.w_material * mat_loss
-            + c.beta_atm * kl_atm
-            + c.beta_surf * kl_surf
         )
 
         return {
@@ -810,6 +775,4 @@ class SpectralFoundation(nn.Module):
             "atmosphere": atm_loss.detach(),
             "temperature": temp_loss.detach(),
             "material": mat_loss.detach(),
-            "kl_atm": kl_atm.detach(),
-            "kl_surf": kl_surf.detach(),
         }

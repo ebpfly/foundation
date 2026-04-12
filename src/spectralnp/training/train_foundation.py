@@ -131,8 +131,6 @@ def train(args: argparse.Namespace) -> None:
         w_temp=args.w_temp,
         w_material=args.w_material,
         w_physics=args.w_physics,
-        beta_atm=args.beta_atm,
-        beta_surf=args.beta_surf,
     )
 
     model = SpectralFoundation(config).to(device)
@@ -177,19 +175,10 @@ def train(args: argparse.Namespace) -> None:
         epoch_losses = {
             k: 0.0 for k in
             ["total", "reflectance", "physics", "atmosphere",
-             "temperature", "material", "kl_atm", "kl_surf"]
+             "temperature", "material"]
         }
         n_batches = 0
         t0 = time.time()
-
-        # KL annealing: linearly ramp beta_atm and beta_surf
-        if args.beta_warmup > 0 and epoch <= args.beta_warmup:
-            warm = epoch / args.beta_warmup
-            model.config.beta_atm = args.beta_atm * warm
-            model.config.beta_surf = args.beta_surf * warm
-        else:
-            model.config.beta_atm = args.beta_atm
-            model.config.beta_surf = args.beta_surf
 
         for batch in loader:
             wl = batch["wavelength"].to(device)
@@ -240,9 +229,6 @@ def train(args: argparse.Namespace) -> None:
             f"atm={avg['atmosphere']:.3f}  "
             f"temp={avg['temperature']:.3f}  "
             f"mat={avg['material']:.3f}  "
-            f"klA={avg['kl_atm']:.2f}  "
-            f"klS={avg['kl_surf']:.2f}  "
-            f"β_a={model.config.beta_atm:.3f}  "
             f"lr={lr:.2e}  "
             f"{dt:.1f}s"
         )
@@ -320,9 +306,6 @@ def main() -> None:
     p.add_argument("--w-temp", type=float, default=1.0)
     p.add_argument("--w-material", type=float, default=0.1)
     p.add_argument("--w-physics", type=float, default=0.5)
-    p.add_argument("--beta-atm", type=float, default=0.01)
-    p.add_argument("--beta-surf", type=float, default=0.01)
-    p.add_argument("--beta-warmup", type=int, default=10)
 
     # Training
     p.add_argument("--epochs", type=int, default=50)
@@ -347,7 +330,7 @@ def main() -> None:
     print(f"Device: {args.device}")
     print(
         f"Config: z_atm={args.z_atm_dim}, z_surf={args.z_surf_dim}, "
-        f"feat={args.feature_dim}, β_atm={args.beta_atm}"
+        f"feat={args.feature_dim}"
     )
 
     train(args)
