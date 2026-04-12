@@ -192,7 +192,8 @@ class StochasticEncoder(nn.Module):
         # per-query structure instead of destroying it with mean-pool.
         # K*d_model → z_dim captures much more spectral detail.
         self.to_mu = nn.Linear(n_queries * d_model, z_dim)
-        self.to_log_sigma = nn.Linear(n_queries * d_model, z_dim)
+        # log_sigma gets band-count signal: more bands → tighter posterior.
+        self.to_log_sigma = nn.Linear(n_queries * d_model + 2, z_dim)
 
     def forward(self, h: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Return (mu, log_sigma) of q(z | context).
@@ -209,7 +210,16 @@ class StochasticEncoder(nn.Module):
         # Flatten K×d into a single vector — preserves per-query structure.
         flat = attended.reshape(B, -1)  # (B, K*d)
         mu = self.to_mu(flat)
-        log_sigma = self.to_log_sigma(flat)
+        # Inject band-count signal so log_sigma can vary with input density.
+        if mask is not None:
+            n_valid = mask.sum(dim=1, keepdim=True).float()  # (B, 1)
+        else:
+            n_valid = torch.full((B, 1), h.shape[1], device=h.device, dtype=h.dtype)
+        band_signal = torch.cat([
+            torch.log(n_valid + 1),       # log band count
+            n_valid / 425.0,              # fraction of output grid covered
+        ], dim=-1)  # (B, 2)
+        log_sigma = self.to_log_sigma(torch.cat([flat, band_signal], dim=-1))
         # Clamp log_sigma. The floor prevents posterior collapse — if too
         # low, z becomes deterministic and epistemic uncertainty vanishes.
         # -2 → sigma ≈ 0.14, enough variance for meaningful z-sampling.

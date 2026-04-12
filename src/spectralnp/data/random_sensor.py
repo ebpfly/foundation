@@ -53,7 +53,10 @@ def sample_virtual_sensor(
     VirtualSensor with sorted band positions.
     """
     if strategy == "mixed":
-        strategy = rng.choice(["uniform", "clustered", "regular"])
+        strategy = rng.choice([
+            "uniform", "clustered", "regular",
+            "edge_only", "gap_max",  # adversarial strategies
+        ])
 
     n_bands = rng.integers(n_bands_range[0], n_bands_range[1] + 1)
     wl_lo, wl_hi = wavelength_range
@@ -88,6 +91,30 @@ def sample_virtual_sensor(
         # Constant FWHM for this sensor.
         fwhm_val = rng.uniform(fwhm_range[0], min(fwhm_range[1], 20.0))
         fwhms = np.full(n_bands, fwhm_val)
+
+    elif strategy == "edge_only":
+        # Adversarial: bands only at the spectral edges, large gap in middle.
+        n_lo = max(1, n_bands // 2)
+        n_hi = n_bands - n_lo
+        lo_bands = rng.uniform(wl_lo, wl_lo + (wl_hi - wl_lo) * 0.2, size=n_lo)
+        hi_bands = rng.uniform(wl_hi - (wl_hi - wl_lo) * 0.2, wl_hi, size=n_hi)
+        centers = np.concatenate([lo_bands, hi_bands])
+        fwhms = rng.uniform(fwhm_range[0], fwhm_range[1], size=n_bands)
+
+    elif strategy == "gap_max":
+        # Adversarial: place bands to create large unobserved gaps.
+        # Pick 2-4 narrow windows, leaving most of the range unobserved.
+        n_windows = rng.integers(2, 5)
+        window_width = (wl_hi - wl_lo) * 0.05  # each window is 5% of range
+        window_centers = rng.uniform(wl_lo + window_width, wl_hi - window_width, size=n_windows)
+        bands_per_window = max(1, n_bands // n_windows)
+        centers_list = []
+        for wc in window_centers:
+            c = rng.uniform(wc - window_width / 2, wc + window_width / 2, size=bands_per_window)
+            centers_list.append(c)
+        centers = np.concatenate(centers_list)[:n_bands]
+        centers = np.clip(centers, wl_lo, wl_hi)
+        fwhms = rng.uniform(fwhm_range[0], fwhm_range[1], size=len(centers))
 
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
