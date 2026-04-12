@@ -58,41 +58,64 @@ def aug_flip(spec: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 
 
 def aug_stretch(spec: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Stretch or squeeze the wavelength axis by a random factor.
+    """Stretch features by resampling a sub-interval to the full length.
 
-    Selects a random sub-interval of the spectrum and resamples it
-    to the full length, effectively "zooming in" on a portion.
+    Uses cosine-tapered edges to avoid sharp dropoffs at the boundaries.
     """
     n = len(spec)
-    # Random crop: keep 50-100% of the spectrum, then resample to full
-    frac = rng.uniform(0.5, 1.0)
+    frac = rng.uniform(0.6, 0.95)
     crop_len = max(int(n * frac), 2)
     start = rng.integers(0, n - crop_len + 1)
     cropped = spec[start : start + crop_len]
-    return _resample(cropped, n)
+    stretched = _resample(cropped, n)
+    # Cosine taper at edges so the transition is smooth
+    taper_len = min(n // 10, 200)
+    if taper_len > 1:
+        t = 0.5 * (1 - np.cos(np.pi * np.arange(taper_len) / taper_len))
+        stretched[:taper_len] = spec[:taper_len] * (1 - t) + stretched[:taper_len] * t
+        stretched[-taper_len:] = spec[-taper_len:] * (1 - t[::-1]) + stretched[-taper_len:] * t[::-1]
+    return stretched.astype(np.float32)
 
 
-def aug_squeeze(spec: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Squeeze features: embed the spectrum in a wider baseline, leaving
-    flat regions on either side."""
+def aug_amplitude_envelope(spec: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Multiply by a smooth random amplitude envelope.
+
+    Low-frequency sinusoidal modulation that preserves feature shapes
+    but changes relative amplitudes across the spectrum — like viewing
+    the same material at different temperatures or through different
+    atmospheric windows.
+    """
     n = len(spec)
-    frac = rng.uniform(0.5, 0.85)
-    target_len = max(int(n * frac), 2)
-    squeezed = _resample(spec, target_len)
-    # Embed in a flat baseline (value = edge value)
-    out = np.full(n, float(spec[0]), dtype=np.float32)
-    start = rng.integers(0, n - target_len + 1)
-    out[start : start + target_len] = squeezed
-    # Blend edges smoothly
-    blend = min(20, target_len // 4)
-    if blend > 1:
-        t = np.linspace(0, 1, blend).astype(np.float32)
-        out[start : start + blend] = (1 - t) * out[start] + t * squeezed[:blend]
-        out[start + target_len - blend : start + target_len] = (
-            t * out[start + target_len - 1]
-            + (1 - t) * squeezed[-blend:]
-        )
-    return out
+    x = np.linspace(0, 1, n)
+    envelope = np.ones(n, dtype=np.float64)
+    for _ in range(rng.integers(1, 4)):
+        freq = rng.uniform(0.3, 2.0)
+        phase = rng.uniform(0, 2 * np.pi)
+        amp = rng.uniform(0.05, 0.25)
+        envelope += amp * np.sin(2 * np.pi * freq * x + phase)
+    return np.clip(spec * envelope, 0.0, 1.0).astype(np.float32)
+
+
+def aug_add_features(spec: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Add 1-3 random Gaussian absorption features.
+
+    Simulates adding or deepening spectral features on an existing
+    spectrum — like a surface with additional minor mineral components.
+    """
+    n = len(spec)
+    out = spec.copy()
+    for _ in range(rng.integers(1, 4)):
+        center = rng.uniform(0.1, 0.9)
+        width = rng.uniform(0.02, 0.12)
+        depth = rng.uniform(0.03, 0.15)
+        x = np.linspace(0, 1, n)
+        feature = depth * np.exp(-0.5 * ((x - center) / width) ** 2)
+        # Randomly add or subtract (absorption dip or emission bump)
+        if rng.random() < 0.5:
+            out = out - feature
+        else:
+            out = out + feature
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
 def aug_shift_scale(spec: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -146,7 +169,8 @@ TRANSFORMS = [
     ("identity", aug_identity),
     ("flip", aug_flip),
     ("stretch", aug_stretch),
-    ("squeeze", aug_squeeze),
+    ("amp_envelope", aug_amplitude_envelope),
+    ("add_features", aug_add_features),
     ("shift_scale", aug_shift_scale),
     ("smooth_warp", aug_smooth_warp),
 ]
