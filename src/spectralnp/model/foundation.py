@@ -54,11 +54,11 @@ class FoundationConfig:
     # Bayesian solve.
     n_pca_radiance: int = 0
     n_pca_reflectance: int = 0
-    pca_eigvalue_floor_ratio: float = 1e-4
+    pca_eigvalue_floor_ratio: float = 1e-5
 
     # ---- Latents ----
     z_atm_dim: int = 32       # scene-shared atmospheric latent (small)
-    z_surf_dim: int = 96      # per-pixel surface latent
+    z_surf_dim: int = 256     # per-pixel surface latent (needs capacity for 10k materials)
     feature_dim: int = 256    # per-pixel shared feature dimension
 
     # ---- Network sizes ----
@@ -526,11 +526,31 @@ class SpectralFoundation(nn.Module):
         pca_mu: Tensor,     # (B, K, n_pca_rad)
         pca_var: Tensor,    # (B, K, n_pca_rad)
     ) -> Tensor:
-        """Map per-pixel PCA posterior to per-pixel feature vector h_i."""
+        """Map per-pixel PCA posterior to per-pixel feature vector h_i.
+
+        During training, we SAMPLE from the PCA posterior instead of
+        passing the mean directly.  This injects the stage-1 uncertainty
+        as actual noise, forcing the downstream network to produce
+        outputs whose spread reflects observation quality:
+
+          - Few bands → large var_c → noisy sample → spread predictions
+          - Many bands → small var_c → tight sample → tight predictions
+
+        The variance is still passed as a feature so the encoder knows
+        *how noisy* the sample is.
+        """
         prior_std = (self.rad_pca_variances + 1e-10).sqrt()
-        mu_norm = pca_mu / prior_std
+
+        # --- Sample from the PCA posterior during training ---
+        if self.training:
+            pca_sample = pca_mu + torch.randn_like(pca_mu) * pca_var.clamp(min=0.0).sqrt()
+        else:
+            pca_sample = pca_mu
+
+        # Normalise by prior std for scale-invariance
+        sample_norm = pca_sample / prior_std
         var_norm = pca_var / (self.rad_pca_variances + 1e-10)
-        x = torch.cat([mu_norm, var_norm], dim=-1)            # (B, K, 2*n_pca)
+        x = torch.cat([sample_norm, var_norm], dim=-1)        # (B, K, 2*n_pca)
         return self.shared_trunk(x)                           # (B, K, feature_dim)
 
     def _fuse_atmosphere(
@@ -580,8 +600,9 @@ class SpectralFoundation(nn.Module):
 
     @staticmethod
     def reparameterize(mu: Tensor, log_var: Tensor) -> Tensor:
-        if not torch.is_grad_enabled():
-            return mu
+        """Sample with the reparameterization trick.  Always samples
+        (including at eval time) so that MC inference over multiple
+        forward passes gives calibrated uncertainty."""
         std = (0.5 * log_var).exp()
         return mu + std * torch.randn_like(std)
 

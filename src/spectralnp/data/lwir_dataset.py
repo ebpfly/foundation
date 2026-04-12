@@ -67,14 +67,17 @@ class LWIRDataset(Dataset):
         # Load library
         lib_wl, lib_emiss, lib_names = read_envi_sli(library_path)
 
-        # Derive categories from names (format: "{category}_{index}")
+        # Each spectrum is its own material class (10k-way identification).
+        # The model must learn to distinguish all individual library members.
+        self.n_material_classes = lib_emiss.shape[0]
+
+        # Also keep category-level info for diagnostics / grouping.
         categories = [n.rsplit("_", 1)[0] for n in lib_names]
         self.category_names = sorted(set(categories))
         name_to_id = {c: i for i, c in enumerate(self.category_names)}
         self.category_id_by_spec = np.array(
             [name_to_id[c] for c in categories], dtype=np.int64,
         )
-        self.n_material_classes = len(self.category_names)
 
         # Dense wavelength grid (for simulation and targets)
         if dense_wavelength_nm is None:
@@ -190,7 +193,7 @@ class LWIRDataset(Dataset):
             "surface_temperature_k": torch.tensor(
                 atmos.surface_temperature_k or 300.0, dtype=torch.float32,
             ),
-            "material_idx": int(self.category_id_by_spec[spec_idx]),
+            "material_idx": spec_idx,  # spectrum ID (0–N), not class ID
         }
 
 

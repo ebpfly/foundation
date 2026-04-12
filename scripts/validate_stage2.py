@@ -139,23 +139,29 @@ def convergence_test(
         band_rad = apply_sensor(sensor, dense_wl, truth).astype(np.float32)
         band_rad = add_sensor_noise(band_rad, rng, snr_range=(snr, snr)).astype(np.float32)
 
-        # Multiple z samples for MC uncertainty
+        # Multiple MC samples for uncertainty propagation
         n_mc = 16
         refl_samples = []
         temp_samples = []
         atmos_samples = []
+        logit_accum = None
+        wl_t = torch.from_numpy(centers).unsqueeze(0)
+        fw_t = torch.from_numpy(fwhms).unsqueeze(0)
+        rad_t = torch.from_numpy(band_rad).unsqueeze(0)
+        mask_t = torch.ones(1, len(centers), dtype=torch.bool)
         for _ in range(n_mc):
-            out = model(
-                torch.from_numpy(centers).unsqueeze(0),
-                torch.from_numpy(fwhms).unsqueeze(0),
-                torch.from_numpy(band_rad).unsqueeze(0),
-                torch.ones(1, len(centers), dtype=torch.bool),
-            )
+            out = model(wl_t, fw_t, rad_t, mask_t)
             refl_samples.append(out.reflectance[0, 0].cpu().numpy())
             temp_samples.append(out.temp_mu[0, 0, 0].item())
             atmos_samples.append(out.atmos_mu[0].cpu().numpy())
+            logits = out.material_logits[0, 0].cpu()  # (n_classes,)
+            if logit_accum is None:
+                logit_accum = torch.zeros_like(logits)
+            logit_accum += torch.softmax(logits, dim=-1)
 
         refl_arr = np.stack(refl_samples)
+        # Average softmax across MC samples
+        avg_probs = (logit_accum / n_mc).numpy()
         results.append({
             "n_bands": n,
             "refl_mean": refl_arr.mean(axis=0),
@@ -164,6 +170,7 @@ def convergence_test(
             "temp_std": float(np.std(temp_samples)),
             "atmos_mean": np.mean(atmos_samples, axis=0),
             "atmos_std": np.std(atmos_samples, axis=0),
+            "avg_probs": avg_probs,
             "input_wl": centers,
             "input_rad": band_rad,
         })
@@ -406,8 +413,13 @@ def main() -> None:
     rmse_at = {n: [] for n in BAND_COUNTS}
     temp_errs = []
     atmos_errs = []
+    # Material identification: per band-count top-k accuracy
+    top1_at = {n: [] for n in BAND_COUNTS}
+    top5_at = {n: [] for n in BAND_COUNTS}
+    top100_at = {n: [] for n in BAND_COUNTS}
     for si, idx in enumerate(test_indices):
-        r_e = refl_matrix[int(idx)]
+        true_idx = int(idx)
+        r_e = refl_matrix[true_idx]
         a_e = _make_atmos(rng, args.mode)
         g_e = _make_geom(rng, args.mode)
         d_e = convergence_test(
@@ -417,12 +429,17 @@ def main() -> None:
         m_e = _compute_metrics(d_e)
         for i, n in enumerate(BAND_COUNTS):
             rmse_at[n].append(m_e["rmse_refl"][i])
+            probs = d_e["results"][i].get("avg_probs")
+            if probs is not None and len(probs) > true_idx:
+                ranked = np.argsort(-probs)
+                rank = int(np.where(ranked == true_idx)[0][0])
+                top1_at[n].append(rank < 1)
+                top5_at[n].append(rank < 5)
+                top100_at[n].append(rank < 100)
         # Use the highest-band-count result for task accuracy
         last = d_e["results"][-1]
-        # Temperature target: (T - 290) / 40
         t_norm_true = (a_e.surface_temperature_k - 290.0) / 40.0
         temp_errs.append(abs(last["temp_mean"] - t_norm_true))
-        # Atmos target
         a_true = _atmos_params_vec(a_e, g_e, args.mode)
         atmos_errs.append(np.abs(last["atmos_mean"] - a_true).mean())
 
@@ -432,6 +449,18 @@ def main() -> None:
     print(f"  Temperature MAE (normalized): {np.mean(temp_errs):.4f}")
     print(f"  Temperature MAE (Kelvin):     {np.mean(temp_errs) * 40.0:.2f} K")
     print(f"  Atmos MAE (normalized):       {np.mean(atmos_errs):.4f}")
+
+    # ---- Material identification (top-k accuracy) ----
+    if any(top1_at[BAND_COUNTS[-1]]):
+        print()
+        print("=== Material identification (10k-way) ===")
+        for n in BAND_COUNTS:
+            if not top1_at[n]:
+                continue
+            t1 = float(np.mean(top1_at[n]))
+            t5 = float(np.mean(top5_at[n]))
+            t100 = float(np.mean(top100_at[n]))
+            print(f"  @ {n:4d} bands:  top1={t1:.1%}  top5={t5:.1%}  top100={t100:.1%}")
 
     # ---- Disentanglement ----
     print()

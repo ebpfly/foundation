@@ -310,7 +310,7 @@ def main() -> None:
     p.add_argument("--n-pca", type=int, default=0,
                     help="PCA components (0 = full rank, recommended)")
     p.add_argument("--z-atm-dim", type=int, default=32)
-    p.add_argument("--z-surf-dim", type=int, default=96)
+    p.add_argument("--z-surf-dim", type=int, default=256)
     p.add_argument("--feature-dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.1)
 
