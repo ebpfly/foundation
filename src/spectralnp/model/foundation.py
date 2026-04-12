@@ -55,6 +55,7 @@ class FoundationConfig:
     n_pca_radiance: int = 0
     n_pca_reflectance: int = 0
     pca_eigvalue_floor_ratio: float = 1e-5
+    n_pca_max: int = 200         # hard cap regardless of eigenvalue ratio
 
     # ---- Latents ----
     z_atm_dim: int = 32       # scene-shared atmospheric latent (small)
@@ -360,12 +361,12 @@ class SpectralFoundation(nn.Module):
         floor_var = max_var * self.config.pca_eigvalue_floor_ratio
         effective_rank = int(np.sum(all_variances >= floor_var))
 
-        # User-specified cap (n_pca_radiance) still applies
+        # Apply user-specified cap AND hard max
         n_req = self.config.n_pca_radiance
         if n_req <= 0:
-            n = effective_rank
+            n = min(effective_rank, self.config.n_pca_max)
         else:
-            n = min(n_req, effective_rank, len(S_rad))
+            n = min(n_req, effective_rank, self.config.n_pca_max, len(S_rad))
 
         variances = all_variances[:n].copy()
         # Tiny prior floor to avoid exact zeros in the precision
@@ -386,9 +387,9 @@ class SpectralFoundation(nn.Module):
 
         m_req = self.config.n_pca_reflectance
         if m_req <= 0:
-            m = effective_refl_rank
+            m = min(effective_refl_rank, self.config.n_pca_max)
         else:
-            m = min(m_req, effective_refl_rank, len(S_refl))
+            m = min(m_req, effective_refl_rank, self.config.n_pca_max, len(S_refl))
 
         self.refl_pca_mean = torch.from_numpy(refl_mean.astype(np.float32)).to(device)
         self.refl_pca_components = torch.from_numpy(Vt_refl[:m].astype(np.float32)).to(device)
