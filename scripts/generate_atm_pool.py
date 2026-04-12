@@ -71,28 +71,38 @@ def main() -> None:
 
     print(f"Generating {args.n_atm} atmospheres...")
     t0 = time.time()
-    for i in range(args.n_atm):
+    i = 0
+    n_skipped = 0
+    while i < args.n_atm:
         atm = sampler.sample_one()
 
-        # Transmission
-        trans_r = calc.compute_transmission(atm)
-        tau = trans_r.transmission
-        if flip:
-            tau = tau[::-1]
+        try:
+            # Transmission
+            trans_r = calc.compute_transmission(atm)
+            tau = trans_r.transmission
+            if flip:
+                tau = tau[::-1]
 
-        # Upwelling path radiance (atmosphere only, no surface)
-        up_r = calc.compute_upwelling(
-            atm, observer_altitude=800e3, atmosphere_only=True,
-        )
-        lup = up_r.radiance
-        if flip:
-            lup = lup[::-1]
+            # Upwelling path radiance (atmosphere only, no surface)
+            up_r = calc.compute_upwelling(
+                atm, observer_altitude=800e3, atmosphere_only=True,
+            )
+            lup = up_r.radiance
+            if flip:
+                lup = lup[::-1]
 
-        # Downwelling
-        dn_r = calc.compute_downwelling(atm)
-        ldn = dn_r.radiance
-        if flip:
-            ldn = ldn[::-1]
+            # Downwelling
+            dn_r = calc.compute_downwelling(atm)
+            ldn = dn_r.radiance
+            if flip:
+                ldn = ldn[::-1]
+        except Exception as e:
+            # ARTS can fail on extreme profiles (e.g. temperature outside
+            # the LUT range).  Skip and retry with a fresh atmosphere.
+            n_skipped += 1
+            if n_skipped % 10 == 1:
+                print(f"  skipped {n_skipped} (last: {str(e)[:80]})")
+            continue
 
         # Convert radiance units to W/(m²·sr·μm)
         tau_pool[i] = tau.astype(np.float32)
@@ -107,6 +117,10 @@ def main() -> None:
                   f"τ=[{tau.min():.3f},{tau.max():.3f}]  "
                   f"Lup=[{lup_pool[i].min():.2f},{lup_pool[i].max():.2f}]  "
                   f"{rate:.2f} atm/s  ETA {eta/60:.0f}m")
+        i += 1
+
+    if n_skipped > 0:
+        print(f"  (skipped {n_skipped} atmospheres due to ARTS errors)")
 
     total = time.time() - t0
     print(f"\nDone in {total/60:.1f} min ({total/args.n_atm:.1f} s/atm)")
