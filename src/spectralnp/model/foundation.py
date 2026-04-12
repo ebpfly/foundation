@@ -529,11 +529,11 @@ class SpectralFoundation(nn.Module):
         """
         prior_std = (self.rad_pca_variances + 1e-10).sqrt()
 
-        # --- Sample from the PCA posterior during training ---
-        if self.training:
-            pca_sample = pca_mu + torch.randn_like(pca_mu) * pca_var.clamp(min=0.0).sqrt()
-        else:
-            pca_sample = pca_mu
+        # --- ALWAYS sample from the PCA posterior ---
+        # During training this acts as a regularizer.  During eval,
+        # multiple forward passes with different samples give MC
+        # uncertainty.  The caller controls the number of MC passes.
+        pca_sample = pca_mu + torch.randn_like(pca_mu) * pca_var.clamp(min=0.0).sqrt()
 
         # Normalise by prior std for scale-invariance
         sample_norm = pca_sample / prior_std

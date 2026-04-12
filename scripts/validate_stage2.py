@@ -230,8 +230,8 @@ def disentanglement_check(
             torch.from_numpy(band_rad).unsqueeze(0),
             torch.ones(1, n_bands, dtype=torch.bool),
         )
-        z_surf_all.append(out.z_surf_mu[0, 0].cpu().numpy())
-        z_atm_all.append(out.z_atm_mu[0].cpu().numpy())
+        z_surf_all.append(out.z_surf[0, 0].cpu().numpy())
+        z_atm_all.append(out.z_atm[0].cpu().numpy())
 
     z_surf_arr = np.stack(z_surf_all)       # (n_atm, z_surf_dim)
     z_atm_arr = np.stack(z_atm_all)         # (n_atm, z_atm_dim)
