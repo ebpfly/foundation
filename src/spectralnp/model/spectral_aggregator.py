@@ -213,7 +213,7 @@ class StochasticEncoder(nn.Module):
         # Clamp log_sigma. The floor prevents posterior collapse — if too
         # low, z becomes deterministic and epistemic uncertainty vanishes.
         # -2 → sigma ≈ 0.14, enough variance for meaningful z-sampling.
-        log_sigma = log_sigma.clamp(-2.0, 2.0)
+        log_sigma = log_sigma.clamp(-6.0, 2.0)
         return mu, log_sigma
 
 
