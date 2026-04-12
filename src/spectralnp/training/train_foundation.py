@@ -73,6 +73,7 @@ def train(args: argparse.Namespace) -> None:
             )
         dataset = LWIRDataset(
             library_path=args.lwir_library,
+            atm_pool_path=args.atm_pool,
             samples_per_epoch=args.samples_per_epoch,
             n_bands_range=(3, 200),
             fwhm_range_nm=(10.0, 200.0),
@@ -287,6 +288,9 @@ def main() -> None:
                     help="Spectral regime to train on")
     p.add_argument("--lwir-library", type=str, default="data/lwir_library",
                     help="Base path to ENVI .sli LWIR emissivity library")
+    p.add_argument("--atm-pool", type=str, default="data/atm_pool.npz",
+                    help="Path to atmosphere pool .npz (LWIR mode). "
+                         "Falls back to simplified RTM if not found.")
     p.add_argument("--usgs-data", type=str, default=None,
                     help="Path to USGS reflectance data (VNIR mode only)")
     p.add_argument("--samples-per-epoch", type=int, default=5000)

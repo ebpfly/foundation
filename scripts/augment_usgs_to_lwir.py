@@ -140,6 +140,74 @@ def aug_mix(
     return (alpha * spec + (1 - alpha) * other).astype(np.float32)
 
 
+# ---------------------------------------------------------------------------
+# Nonlinear augmentation transforms
+# ---------------------------------------------------------------------------
+
+def aug_product(
+    spec: np.ndarray,
+    rng: np.random.Generator,
+    all_spectra: np.ndarray,
+) -> np.ndarray:
+    """Element-wise product of two spectra — simulates layered materials
+    or double-pass absorption."""
+    other_idx = rng.integers(0, len(all_spectra))
+    other = all_spectra[other_idx]
+    return (spec * other).astype(np.float32)
+
+
+def aug_geometric_mean(
+    spec: np.ndarray,
+    rng: np.random.Generator,
+    all_spectra: np.ndarray,
+) -> np.ndarray:
+    """Geometric mean of two spectra — smoother than product, preserves
+    intermediate features from both parents."""
+    other_idx = rng.integers(0, len(all_spectra))
+    other = all_spectra[other_idx]
+    return np.sqrt(np.clip(spec * other, 0, 1)).astype(np.float32)
+
+
+def aug_power(spec: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Raise spectrum to a random power — sharpens or softens features.
+    α < 1: lifts low values (washes out features)
+    α > 1: deepens low values (enhances features)."""
+    alpha = rng.uniform(0.3, 3.0)
+    return np.clip(spec, 1e-6, 1.0).__pow__(alpha).astype(np.float32)
+
+
+def aug_feature_transplant(
+    spec: np.ndarray,
+    rng: np.random.Generator,
+    all_spectra: np.ndarray,
+) -> np.ndarray:
+    """Transplant absorption features from a donor onto this spectrum's
+    baseline.  Extracts the donor's deviation from its own mean and
+    adds it to the recipient."""
+    donor_idx = rng.integers(0, len(all_spectra))
+    donor = all_spectra[donor_idx]
+    # Donor features = deviation from smoothed baseline
+    from scipy.ndimage import uniform_filter1d
+    donor_baseline = uniform_filter1d(donor.astype(np.float64), size=200)
+    donor_features = donor - donor_baseline
+    # Scale the transplanted features
+    scale = rng.uniform(0.3, 1.5)
+    return np.clip(spec + scale * donor_features, 0.0, 1.0).astype(np.float32)
+
+
+def aug_min_blend(
+    spec: np.ndarray,
+    rng: np.random.Generator,
+    all_spectra: np.ndarray,
+) -> np.ndarray:
+    """Element-wise minimum — takes the deepest absorption at each
+    wavelength from either spectrum, simulating a mixture where both
+    components contribute independently."""
+    other_idx = rng.integers(0, len(all_spectra))
+    other = all_spectra[other_idx]
+    return np.minimum(spec, other).astype(np.float32)
+
+
 def aug_smooth_warp(spec: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """Non-linear wavelength distortion using random control points.
 
@@ -164,15 +232,24 @@ def aug_smooth_warp(spec: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return np.interp(x_warped, x_in, spec).astype(np.float32)
 
 
-# All transforms (excluding mix, which needs the full array)
-TRANSFORMS = [
-    ("identity", aug_identity),
+# Single-spectrum transforms (don't need the full library)
+SINGLE_TRANSFORMS = [
     ("flip", aug_flip),
     ("stretch", aug_stretch),
     ("amp_envelope", aug_amplitude_envelope),
     ("add_features", aug_add_features),
     ("shift_scale", aug_shift_scale),
     ("smooth_warp", aug_smooth_warp),
+    ("power", aug_power),
+]
+
+# Two-spectrum transforms (need the full library for the second operand)
+PAIR_TRANSFORMS = [
+    ("mix", aug_mix),
+    ("product", aug_product),
+    ("geometric_mean", aug_geometric_mean),
+    ("feature_transplant", aug_feature_transplant),
+    ("min_blend", aug_min_blend),
 ]
 
 
@@ -246,13 +323,12 @@ def main() -> None:
         base_spec = base_matrix[base_idx]
         base_cat = base_categories[base_idx]
 
-        # Pick a random transform (or mix)
-        if rng.random() < 0.15:
-            # Mix with another spectrum
-            aug = aug_mix(base_spec, rng, base_matrix)
-            tname = "mix"
+        # Pick a random transform — 40% nonlinear (pair), 60% single-spectrum
+        if rng.random() < 0.4:
+            tname, tfn = PAIR_TRANSFORMS[rng.integers(0, len(PAIR_TRANSFORMS))]
+            aug = tfn(base_spec, rng, base_matrix)
         else:
-            tname, tfn = TRANSFORMS[rng.integers(1, len(TRANSFORMS))]  # skip identity
+            tname, tfn = SINGLE_TRANSFORMS[rng.integers(0, len(SINGLE_TRANSFORMS))]
             aug = tfn(base_spec, rng)
 
         aug = np.clip(aug, 0.0, 1.0).astype(np.float32)
