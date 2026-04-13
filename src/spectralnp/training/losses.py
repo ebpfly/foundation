@@ -261,6 +261,8 @@ class SpectralNPLoss(torch.nn.Module):
                 output.spectral_mu, output.spectral_log_var, target_radiance,
                 feature_weight_strength=self.feature_weight_strength,
             )
+            # MSE auxiliary: direct gradient on mu regardless of sigma.
+            losses["spectral_mse"] = (output.spectral_mu - target_radiance).pow(2).mean()
             if self.w_calibration > 0:
                 losses["spectral_calib"] = calibration_loss(
                     output.spectral_mu, output.spectral_log_var, target_radiance
@@ -272,6 +274,7 @@ class SpectralNPLoss(torch.nn.Module):
                 output.reflectance_mu, output.reflectance_log_var, target_reflectance,
                 feature_weight_strength=self.feature_weight_strength,
             )
+            losses["reflectance_mse"] = (output.reflectance_mu - target_reflectance).pow(2).mean()
             if self.w_calibration > 0:
                 losses["reflectance_calib"] = calibration_loss(
                     output.reflectance_mu, output.reflectance_log_var, target_reflectance
@@ -306,8 +309,12 @@ class SpectralNPLoss(torch.nn.Module):
         total = torch.tensor(0.0, device=target_radiance.device)
         if "spectral" in losses:
             total = total + self.w_spectral * losses["spectral"]
+        if "spectral_mse" in losses:
+            total = total + 0.1 * losses["spectral_mse"]  # MSE auxiliary
         if "reflectance" in losses:
             total = total + self.w_reflectance * losses["reflectance"]
+        if "reflectance_mse" in losses:
+            total = total + 0.1 * losses["reflectance_mse"]
         if "spectral_calib" in losses:
             total = total + self.w_calibration * losses["spectral_calib"]
         if "reflectance_calib" in losses:
