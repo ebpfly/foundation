@@ -278,7 +278,8 @@ class SpectralAggregator(nn.Module):
         )
 
         # Stochastic path: per-pixel surface latent.
-        self.stochastic = StochasticEncoder(d_model, z_dim, n_heads=n_heads)
+        # 64 queries (was 32) — more capacity to encode per-band detail.
+        self.stochastic = StochasticEncoder(d_model, z_dim, n_heads=n_heads, n_queries=64)
 
     def forward(
         self,
