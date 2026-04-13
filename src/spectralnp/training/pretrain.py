@@ -206,7 +206,7 @@ def train_one_epoch(
         # Backward.
         optimiser.zero_grad()
         losses["total"].backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimiser.step()
 
         # Accumulate.
@@ -333,7 +333,16 @@ def main() -> None:
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lr_lambda=lambda _: 1.0)
         logger.info("Using constant LR (no cosine decay).")
     else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs)
+        # LR warmup (10 epochs) then cosine decay. Warmup prevents
+        # early garbage gradients from pushing the decoder to a
+        # constant-output basin.
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimiser, start_factor=0.01, total_iters=10
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, args.epochs - 10)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimiser, schedulers=[warmup, cosine], milestones=[10]
+        )
 
     # Resume from checkpoint.
     start_epoch = 0
