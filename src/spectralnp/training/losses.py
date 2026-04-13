@@ -262,7 +262,10 @@ class SpectralNPLoss(torch.nn.Module):
                 feature_weight_strength=self.feature_weight_strength,
             )
             # MSE auxiliary: direct gradient on mu regardless of sigma.
-            losses["spectral_mse"] = (output.spectral_mu - target_radiance).pow(2).mean()
+            mse_per_point = (output.spectral_mu - target_radiance).pow(2)
+            if self.feature_weight_strength > 0:
+                mse_per_point = mse_per_point * _feature_weights(target_radiance, self.feature_weight_strength)
+            losses["spectral_mse"] = mse_per_point.mean()
             if self.w_calibration > 0:
                 losses["spectral_calib"] = calibration_loss(
                     output.spectral_mu, output.spectral_log_var, target_radiance
@@ -274,7 +277,10 @@ class SpectralNPLoss(torch.nn.Module):
                 output.reflectance_mu, output.reflectance_log_var, target_reflectance,
                 feature_weight_strength=self.feature_weight_strength,
             )
-            losses["reflectance_mse"] = (output.reflectance_mu - target_reflectance).pow(2).mean()
+            refl_mse = (output.reflectance_mu - target_reflectance).pow(2)
+            if self.feature_weight_strength > 0:
+                refl_mse = refl_mse * _feature_weights(target_reflectance, self.feature_weight_strength)
+            losses["reflectance_mse"] = refl_mse.mean()
             if self.w_calibration > 0:
                 losses["reflectance_calib"] = calibration_loss(
                     output.reflectance_mu, output.reflectance_log_var, target_reflectance
