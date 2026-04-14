@@ -580,3 +580,34 @@ no-dropout run degraded from 3.06→3.55 over the same interval.)
 ### `iter_grid_drop200` — Same as above, 200 epochs
 
 Longer run to see if RMSE breaks below 3.0.
+
+### `iter_warmup` — PRODUCTION MODEL (best ever)
+
+LR warmup (10 epochs, 0.01→1.0) + cosine decay (400 epochs) + spawn
+multiprocessing fix + grad clip 0.5 + log_sigma clamp [-6,2] +
+425-point target posterior + band-count signal in z_log_sigma.
+
+| Epoch | RMSE@400 | Factor | Sharp ratio | Spectral loss |
+|-------|----------|--------|-------------|---------------|
+| 50    | 4.19     | 2.76×  | 0.92×       | —             |
+| 100   | 4.03     | 4.33×  | 1.63×       | 3.07          |
+| 150   | 3.43     | 7.18×  | 3.83×       | 2.63          |
+| 200   | 2.87     | 5.17×  | 4.19×       | 2.35          |
+| 300   | **1.59** | **15.78×** | **6.35×** | 1.95          |
+| 400   | **1.51** | **15.32×** | **6.67×** | 1.64          |
+
+**Benchmark (AVIRIS-NG):** R²=0.998, RMSE=2.82, SAM=1.45°, Cov@2σ=96.6%
+**Reflectance:** R²=0.932, RMSE=0.073
+**Material:** Top-1=44.0%, Top-3=86.3%, F1=0.381
+
+Key recipe:
+1. GridDecoder with interp+conv upsampling (53→106→212→424→425)
+2. log_sigma clamp [-6, 2] (allows tight posteriors)
+3. 425-point target posterior (was 50)
+4. LR warmup (10 epochs) + cosine decay (400 epochs)
+5. Gradient clipping 0.5 (was 1.0)
+6. Spawn multiprocessing + persistent workers
+7. Band-count signal in z_log_sigma
+8. z=1000 (z_atm=200, z_surf=800)
+9. CRPS + feature_weight=2.0
+10. Band range 3-425, FWHM 1-100nm
