@@ -151,19 +151,23 @@ class SpectralNP(nn.Module):
                 n_layers=cfg.spectral_n_layers,
                 use_r=cfg.spectral_decoder_use_r,
             )
+        # Material decoder ALWAYS uses r — the deterministic path carries
+        # discriminative features that help classification. The no-r constraint
+        # only applies to spectral/reflectance decoders (to force z usage).
         self.material_decoder = MaterialDecoder(
             d_model=cfg.d_model,
             z_dim=z_total,
             n_classes=cfg.n_material_classes,
-            use_r=cfg.spectral_decoder_use_r,
+            use_r=True,
         )
         # Atmospheric decoder uses z_atm only — the atmosphere is shared,
         # it should not depend on per-pixel surface properties.
+        # Atmospheric decoder also uses r — no reason to restrict it.
         self.atmos_decoder = AtmosphericDecoder(
             d_model=cfg.d_model,
             z_dim=cfg.z_atm_dim,
             n_params=cfg.n_atmos_params,
-            use_r=cfg.spectral_decoder_use_r,
+            use_r=True,
         )
 
     @classmethod
