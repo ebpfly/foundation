@@ -16,12 +16,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import multiprocessing
-import platform
-
-# macOS fork is unsafe with MPS/Metal — causes deadlocks with num_workers>0.
-if platform.system() == "Darwin":
-    multiprocessing.set_start_method("spawn", force=True)
 import logging
 from pathlib import Path
 
@@ -304,9 +298,7 @@ def main() -> None:
         batch_size=args.batch_size,
         collate_fn=collate_spectral_batch,
         num_workers=args.num_workers,
-        pin_memory=False,  # not supported on MPS
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=4 if args.num_workers > 0 else None,
+        pin_memory=False,
     )
 
     # Model.
