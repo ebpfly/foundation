@@ -147,6 +147,7 @@ class SpectralNPDataset(Dataset):
 
         # Optional PCA-VAE generator for novel spectra (anti-memorisation).
         self._pca_vae = None
+        self._pca_vae_bank = None  # pre-generated numpy spectra (fork-safe)
         self._pca_vae_wl_lo = 350.0
         self._pca_vae_wl_hi = 2500.0
         if pca_vae_path is not None:
@@ -154,20 +155,25 @@ class SpectralNPDataset(Dataset):
             from spectralnp.model.pca_vae import PCAVAE
 
             ckpt = torch.load(pca_vae_path, map_location="cpu", weights_only=False)
-            self._pca_vae = PCAVAE(ckpt["config"])
+            vae = PCAVAE(ckpt["config"])
             for k in ["pca_mean", "pca_components", "pca_singular_values",
                        "z_mean", "z_cholesky"]:
                 if k in ckpt["model_state_dict"]:
-                    setattr(self._pca_vae, k,
+                    setattr(vae, k,
                             torch.zeros_like(ckpt["model_state_dict"][k]))
-            self._pca_vae.load_state_dict(ckpt["model_state_dict"])
-            self._pca_vae.eval()
+            vae.load_state_dict(ckpt["model_state_dict"])
+            vae.eval()
             # wavelength grid is stored directly in the checkpoint.
             vae_wl = ckpt.get("wavelength_nm")
             if vae_wl is not None:
                 vae_wl = vae_wl if isinstance(vae_wl, np.ndarray) else np.array(vae_wl)
                 self._pca_vae_wl_lo = float(vae_wl[0])
                 self._pca_vae_wl_hi = float(vae_wl[-1])
+            # Pre-generate a bank of spectra as numpy (fork-safe, no PyTorch
+            # model in workers). Regenerate each epoch via refresh_vae_bank().
+            with torch.no_grad():
+                self._pca_vae_bank = vae.generate(n_samples=5000).numpy()
+            del vae  # don't keep the PyTorch model — prevents fork deadlock
 
     def __len__(self) -> int:
         return self.samples_per_epoch
@@ -230,11 +236,10 @@ class SpectralNPDataset(Dataset):
         If a PCA-VAE generator is loaded (``self._pca_vae``), 50% of
         samples are replaced entirely with novel generated spectra.
         """
-        # 50% chance: generate a completely novel spectrum from PCA-VAE
-        if self._pca_vae is not None and self.rng.random() < 0.5:
-            import torch
-            with torch.no_grad():
-                gen = self._pca_vae.generate(n_samples=1).numpy()[0]
+        # 50% chance: use a novel spectrum from pre-generated PCA-VAE bank
+        if self._pca_vae_bank is not None and self.rng.random() < 0.5:
+            idx = self.rng.integers(len(self._pca_vae_bank))
+            gen = self._pca_vae_bank[idx]
             # Resample from the VAE's native grid to the dense grid.
             vae_wl = np.linspace(
                 self._pca_vae_wl_lo, self._pca_vae_wl_hi,
