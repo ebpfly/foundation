@@ -366,14 +366,17 @@ class SpectralNPDataset(Dataset):
             atmos.visibility_km / 100.0,  # normalise to ~[0, 1]
         ], dtype=np.float32)
 
+        # Return numpy arrays (not torch tensors) so that forked DataLoader
+        # workers never touch the PyTorch runtime.  Conversion to tensors
+        # happens in collate_spectral_batch(), which runs in the main process.
         return {
-            "wavelength": torch.from_numpy(sensor.center_wavelength_nm),
-            "fwhm": torch.from_numpy(sensor.fwhm_nm),
-            "radiance": torch.from_numpy(band_radiance),
-            "target_wavelength": torch.from_numpy(self.dense_wl),
-            "target_radiance": torch.from_numpy(dense_radiance),
-            "target_reflectance": torch.from_numpy(reflectance),
-            "atmos_params": torch.from_numpy(atmos_params),
+            "wavelength": sensor.center_wavelength_nm,
+            "fwhm": sensor.fwhm_nm,
+            "radiance": band_radiance,
+            "target_wavelength": self.dense_wl,
+            "target_radiance": dense_radiance,
+            "target_reflectance": reflectance,
+            "atmos_params": atmos_params,
             "material_idx": int(self.category_id_by_spec[spec_idx]),
         }
 
@@ -383,6 +386,10 @@ def collate_spectral_batch(samples: list[dict]) -> dict[str, torch.Tensor]:
 
     Pads input bands to the maximum number in the batch and creates
     a pad_mask.  Target dense spectra are already fixed-length.
+
+    Accepts numpy arrays or torch tensors from __getitem__ — all
+    tensor conversion happens here (in the main process) to avoid
+    touching PyTorch in forked DataLoader workers on macOS/MPS.
     """
     max_bands = max(s["wavelength"].shape[0] for s in samples)
     batch_size = len(samples)
@@ -403,14 +410,16 @@ def collate_spectral_batch(samples: list[dict]) -> dict[str, torch.Tensor]:
 
     for i, s in enumerate(samples):
         n = s["wavelength"].shape[0]
-        wavelength[i, :n] = s["wavelength"]
-        fwhm[i, :n] = s["fwhm"]
-        radiance[i, :n] = s["radiance"]
+        # Support both numpy arrays and torch tensors.
+        _to_t = lambda x: torch.from_numpy(x) if isinstance(x, np.ndarray) else x
+        wavelength[i, :n] = _to_t(s["wavelength"])
+        fwhm[i, :n] = _to_t(s["fwhm"])
+        radiance[i, :n] = _to_t(s["radiance"])
         pad_mask[i, :n] = True
-        target_wavelength[i] = s["target_wavelength"]
-        target_radiance[i] = s["target_radiance"]
-        target_reflectance[i] = s["target_reflectance"]
-        atmos_params[i] = s["atmos_params"]
+        target_wavelength[i] = _to_t(s["target_wavelength"])
+        target_radiance[i] = _to_t(s["target_radiance"])
+        target_reflectance[i] = _to_t(s["target_reflectance"])
+        atmos_params[i] = _to_t(s["atmos_params"])
         material_idx[i] = s["material_idx"]
 
     return {
